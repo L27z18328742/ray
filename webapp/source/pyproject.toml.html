@@ -1,0 +1,80 @@
+<!doctype html><html lang="zh-Hans"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="description" content="从 Ray 入门到读懂 slime/ray：基于固定源码的中文交互教程。">
+<title>pyproject.toml · Ray 与 slime 源码导读</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="stylesheet" href="../assets/tutorial.css"></head><body class="source-page"><header class="topbar">
+<a class="brand" href="../index.html">Ray 与 slime</a><a href="https://github.com/THUDM/slime/blob/5bae5bb7928d65906e24e99f5b5d3f99a4daaf93/pyproject.toml">GitHub 固定版本 ↗</a></header>
+<main class="source-wrap"><p><a href="../chapters/sources.html">← 源码索引</a> · 5bae5bb7928d · 只读快照</p>
+<h1>pyproject.toml</h1><pre class="source-code"><code><span class="source-line" id="L1"><a href="#L1">   1</a> [build-system]</span>
+<span class="source-line" id="L2"><a href="#L2">   2</a> requires = [</span>
+<span class="source-line" id="L3"><a href="#L3">   3</a>     &quot;packaging&quot;,</span>
+<span class="source-line" id="L4"><a href="#L4">   4</a>     &quot;setuptools &gt;= 49.4.0&quot;,</span>
+<span class="source-line" id="L5"><a href="#L5">   5</a>     &quot;wheel&quot;,</span>
+<span class="source-line" id="L6"><a href="#L6">   6</a> ]</span>
+<span class="source-line" id="L7"><a href="#L7">   7</a> build-backend = &quot;setuptools.build_meta&quot;</span>
+<span class="source-line" id="L8"><a href="#L8">   8</a> </span>
+<span class="source-line" id="L9"><a href="#L9">   9</a> [tool.isort]</span>
+<span class="source-line" id="L10"><a href="#L10">  10</a> profile = &quot;black&quot;  # black-compatible</span>
+<span class="source-line" id="L11"><a href="#L11">  11</a> line_length = 119  # should match black parameters</span>
+<span class="source-line" id="L12"><a href="#L12">  12</a> ignore_whitespace = true  # ignore whitespace for compatibility with the initial style</span>
+<span class="source-line" id="L13"><a href="#L13">  13</a> py_version = 310  # python 3.10 as a target version</span>
+<span class="source-line" id="L14"><a href="#L14">  14</a> sections = [&quot;FUTURE&quot;, &quot;STDLIB&quot;, &quot;THIRDPARTY&quot;, &quot;FIRSTPARTY&quot;, &quot;LOCALFOLDER&quot;]</span>
+<span class="source-line" id="L15"><a href="#L15">  15</a> default_section = &quot;THIRDPARTY&quot;</span>
+<span class="source-line" id="L16"><a href="#L16">  16</a> extend_skip = [&quot;setup.py&quot;, &quot;docs/source/conf.py&quot;]</span>
+<span class="source-line" id="L17"><a href="#L17">  17</a> known_first_party = [&quot;slime&quot;, &quot;slime_plugins&quot;]</span>
+<span class="source-line" id="L18"><a href="#L18">  18</a> known_third_party = [&quot;megatron&quot;, &quot;wandb&quot;, &quot;ray&quot;, &quot;transformers&quot;]</span>
+<span class="source-line" id="L19"><a href="#L19">  19</a> src_paths = [&quot;slime&quot;, &quot;slime_plugins&quot;]</span>
+<span class="source-line" id="L20"><a href="#L20">  20</a> </span>
+<span class="source-line" id="L21"><a href="#L21">  21</a> </span>
+<span class="source-line" id="L22"><a href="#L22">  22</a> [tool.black]</span>
+<span class="source-line" id="L23"><a href="#L23">  23</a> line_length = 119</span>
+<span class="source-line" id="L24"><a href="#L24">  24</a> </span>
+<span class="source-line" id="L25"><a href="#L25">  25</a> [tool.ruff]</span>
+<span class="source-line" id="L26"><a href="#L26">  26</a> line-length = 320  # TODO</span>
+<span class="source-line" id="L27"><a href="#L27">  27</a> </span>
+<span class="source-line" id="L28"><a href="#L28">  28</a> [tool.ruff.lint]</span>
+<span class="source-line" id="L29"><a href="#L29">  29</a> select = [</span>
+<span class="source-line" id="L30"><a href="#L30">  30</a>     &quot;E&quot;,      # Pycodestyle Errors (Structural/Fundamental Errors like bad indentation)</span>
+<span class="source-line" id="L31"><a href="#L31">  31</a>     &quot;F&quot;,      # Pyflakes (Core Errors: Unused imports, undefined names)</span>
+<span class="source-line" id="L32"><a href="#L32">  32</a>     &quot;B&quot;,      # Flake8-Bugbear (Logic Bugs: Variable shadowing, dangerous default arguments)</span>
+<span class="source-line" id="L33"><a href="#L33">  33</a>     &quot;UP&quot;,     # pyupgrade (Modernization and compatibility issues)</span>
+<span class="source-line" id="L34"><a href="#L34">  34</a> ]</span>
+<span class="source-line" id="L35"><a href="#L35">  35</a> ignore = [</span>
+<span class="source-line" id="L36"><a href="#L36">  36</a>     &quot;E402&quot;, # module-import-not-at-top-of-file</span>
+<span class="source-line" id="L37"><a href="#L37">  37</a>     &quot;E501&quot;, # Line too long # TODO handle it later</span>
+<span class="source-line" id="L38"><a href="#L38">  38</a> ]</span>
+<span class="source-line" id="L39"><a href="#L39">  39</a> </span>
+<span class="source-line" id="L40"><a href="#L40">  40</a> [tool.pytest.ini_options]</span>
+<span class="source-line" id="L41"><a href="#L41">  41</a> # durations=0 will display all tests execution time, sorted in ascending order starting from from the slowest one.</span>
+<span class="source-line" id="L42"><a href="#L42">  42</a> # -vv will also display tests with duration = 0.00s</span>
+<span class="source-line" id="L43"><a href="#L43">  43</a> addopts = &quot;--verbose --pyargs --durations=0 --strict-markers&quot;  # always add these arguments to pytest</span>
+<span class="source-line" id="L44"><a href="#L44">  44</a> testpaths = [&quot;./tests&quot;]  # must be an explicit path to avoid importing another &quot;tests&quot; module</span>
+<span class="source-line" id="L45"><a href="#L45">  45</a> # directories to ignore when discovering tests</span>
+<span class="source-line" id="L46"><a href="#L46">  46</a> norecursedirs = [</span>
+<span class="source-line" id="L47"><a href="#L47">  47</a>     &quot;external&quot;,</span>
+<span class="source-line" id="L48"><a href="#L48">  48</a>     &quot;examples&quot;,</span>
+<span class="source-line" id="L49"><a href="#L49">  49</a>     &quot;docs&quot;,</span>
+<span class="source-line" id="L50"><a href="#L50">  50</a>     &quot;scripts&quot;,</span>
+<span class="source-line" id="L51"><a href="#L51">  51</a>     &quot;tools&quot;,</span>
+<span class="source-line" id="L52"><a href="#L52">  52</a>     &quot;tutorials&quot;,</span>
+<span class="source-line" id="L53"><a href="#L53">  53</a>     &quot;*.egg&quot;,</span>
+<span class="source-line" id="L54"><a href="#L54">  54</a>     &quot;.*&quot;,</span>
+<span class="source-line" id="L55"><a href="#L55">  55</a>     &quot;_darcs&quot;,</span>
+<span class="source-line" id="L56"><a href="#L56">  56</a>     &quot;build&quot;,</span>
+<span class="source-line" id="L57"><a href="#L57">  57</a>     &quot;CVS&quot;,</span>
+<span class="source-line" id="L58"><a href="#L58">  58</a>     &quot;dist&quot;,</span>
+<span class="source-line" id="L59"><a href="#L59">  59</a>     &quot;venv&quot;,</span>
+<span class="source-line" id="L60"><a href="#L60">  60</a>     &quot;{arch}&quot;,</span>
+<span class="source-line" id="L61"><a href="#L61">  61</a> ]</span>
+<span class="source-line" id="L62"><a href="#L62">  62</a> # markers to select tests, use `pytest --markers` to see all available markers, `pytest -m &quot;&lt;marker&gt;&quot;` to select tests</span>
+<span class="source-line" id="L63"><a href="#L63">  63</a> markers = [</span>
+<span class="source-line" id="L64"><a href="#L64">  64</a>     &quot;unit: marks unit test, i.e. testing a single, well isolated functionality (deselect with &#x27;-m \&quot;not unit\&quot;&#x27;)&quot;,</span>
+<span class="source-line" id="L65"><a href="#L65">  65</a>     &quot;integration: marks test checking the elements when integrated into subsystems (deselect with &#x27;-m \&quot;not integration\&quot;&#x27;)&quot;,</span>
+<span class="source-line" id="L66"><a href="#L66">  66</a>     &quot;system: marks test working at the highest integration level (deselect with &#x27;-m \&quot;not system\&quot;&#x27;)&quot;,</span>
+<span class="source-line" id="L67"><a href="#L67">  67</a>     &quot;acceptance: marks test checking whether the developed product/model passes the user defined acceptance criteria (deselect with &#x27;-m \&quot;not acceptance\&quot;&#x27;)&quot;,</span>
+<span class="source-line" id="L68"><a href="#L68">  68</a>     &quot;docs: mark tests related to documentation (deselect with &#x27;-m \&quot;not docs\&quot;&#x27;)&quot;,</span>
+<span class="source-line" id="L69"><a href="#L69">  69</a>     &quot;skipduringci: marks tests that are skipped ci as they are addressed by Jenkins jobs but should be run to test user setups&quot;,</span>
+<span class="source-line" id="L70"><a href="#L70">  70</a>     &quot;pleasefixme: marks tests that are broken and need fixing&quot;,</span>
+<span class="source-line" id="L71"><a href="#L71">  71</a> ]</span></code></pre></main></body></html>

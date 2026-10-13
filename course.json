@@ -1,0 +1,19 @@
+[
+  {"id":"ch00","title":"先看一轮训练怎样发生","en":"A map before the source","desc":"认识 driver、训练 worker 与推理服务，建立全书主线。","part":"起步","minutes":15,"lab":"map"},
+  {"id":"ch01","title":"第一次 remote：任务与结果引用","en":"Tasks & ObjectRefs","desc":"从本地函数走到远程任务，亲自观察提交、执行与等待。","part":"起步","minutes":20,"lab":"refs"},
+  {"id":"ch02","title":"Actor：让模型留在一个进程里","en":"Stateful workers","desc":"理解句柄、进程、状态与串行调用，辨清三个 actor。","part":"起步","minutes":20,"lab":"actors"},
+  {"id":"ch03","title":"等待、依赖与背压","en":"Dependencies & backpressure","desc":"比较 ray.get、ray.wait 和先提交后等待，读懂 async 的边界。","part":"起步","minutes":20},
+  {"id":"ch04","title":"先安排座位：Placement Group","en":"Reserving the GPU layout","desc":"用训练 2 卡加 rollout 2 卡追踪预留、探测与 GPU 排序。","part":"源码主线","minutes":25,"lab":"placement"},
+  {"id":"ch05","title":"把训练 worker 一个个启动起来","en":"Ranks, actors & process groups","desc":"从 RayTrainGroup 到 rank、MASTER_ADDR，再到 Megatron 初始化。","part":"源码主线","minutes":25},
+  {"id":"ch06","title":"RolloutManager 如何组织生成","en":"From manager to SGLang","desc":"分清 Ray Actor、HTTP 路由器、服务子进程和可替换生成函数。","part":"源码主线","minutes":25},
+  {"id":"ch07","title":"一批数据如何到达训练 GPU","en":"Samples → DP shards → Box","desc":"追踪两个层次的 ObjectRef，解释 driver 为什么不取出整批张量。","part":"源码主线","minutes":30,"lab":"data"},
+  {"id":"ch08","title":"读通 train.py 的一整个循环","en":"The synchronous training loop","desc":"沿生成、训练、保存、清理与更新逐一标出等待位置。","part":"源码主线","minutes":25,"lab":"timeline"},
+  {"id":"ch09","title":"训练完，推理模型怎么拿到新权重","en":"Weight synchronization","desc":"区分样本传输与权重传输，跟进 Ray 控制消息和 NCCL 广播。","part":"源码主线","minutes":30},
+  {"id":"ch10","title":"同卡部署、卸载与进程释放","en":"Colocate, offload & release","desc":"为什么 0.4 GPU 不是 40% 显存，以及三种不同的资源动作。","part":"分支与实战","minutes":20},
+  {"id":"ch11","title":"真正的异步发生在哪里","en":"The fully-async rollout branch","desc":"当前版本的后台线程、asyncio、结果队列和旧策略样本。","part":"分支与实战","minutes":25},
+  {"id":"ch12","title":"卡住与失败时，沿边界排查","en":"Debugging & lifecycle","desc":"区分资源未就绪、模型未初始化、数据未返回和通信未完成。","part":"分支与实战","minutes":25},
+  {"id":"ch13","title":"亲手做一个 CPU 版迷你 slime","en":"A runnable orchestration model","desc":"六个小实验，把 Ray 原语连接成可检查的生成—训练—同步流程。","part":"分支与实战","minutes":40},
+  {"id":"glossary","title":"术语与对象速查","en":"Glossary & object types","desc":"遇到句柄、引用、rank、DP、bundle 时随时回查。","part":"附录","minutes":10},
+  {"id":"practice","title":"理解题与源码寻路任务","en":"Practice without spoilers","desc":"每章一个核心问题，再用五项任务检验你是否能独立读源码。","part":"附录","minutes":30},
+  {"id":"sources","title":"版本、证据与源码索引","en":"Sources & verification","desc":"固定提交、完整本地源码链接、实验版本和明确的验证边界。","part":"附录","minutes":10}
+]

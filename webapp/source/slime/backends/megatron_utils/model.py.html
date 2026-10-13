@@ -1,0 +1,1024 @@
+<!doctype html><html lang="zh-Hans"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="description" content="从 Ray 入门到读懂 slime/ray：基于固定源码的中文交互教程。">
+<title>slime/backends/megatron_utils/model.py · Ray 与 slime 源码导读</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="../../../../assets/style.css">
+<link rel="stylesheet" href="../../../../assets/tutorial.css"></head><body class="source-page"><header class="topbar">
+<a class="brand" href="../../../../index.html">Ray 与 slime</a><a href="https://github.com/THUDM/slime/blob/5bae5bb7928d65906e24e99f5b5d3f99a4daaf93/slime/backends/megatron_utils/model.py">GitHub 固定版本 ↗</a></header>
+<main class="source-wrap"><p><a href="../../../../chapters/sources.html">← 源码索引</a> · 5bae5bb7928d · 只读快照</p>
+<h1>slime/backends/megatron_utils/model.py</h1><pre class="source-code"><code><span class="source-line" id="L1"><a href="#L1">   1</a> import dataclasses</span>
+<span class="source-line" id="L2"><a href="#L2">   2</a> import gc</span>
+<span class="source-line" id="L3"><a href="#L3">   3</a> import logging</span>
+<span class="source-line" id="L4"><a href="#L4">   4</a> import math</span>
+<span class="source-line" id="L5"><a href="#L5">   5</a> import os</span>
+<span class="source-line" id="L6"><a href="#L6">   6</a> from argparse import Namespace</span>
+<span class="source-line" id="L7"><a href="#L7">   7</a> from collections.abc import Callable, Sequence</span>
+<span class="source-line" id="L8"><a href="#L8">   8</a> from contextlib import contextmanager, nullcontext</span>
+<span class="source-line" id="L9"><a href="#L9">   9</a> from functools import partial</span>
+<span class="source-line" id="L10"><a href="#L10">  10</a> from pathlib import Path</span>
+<span class="source-line" id="L11"><a href="#L11">  11</a> </span>
+<span class="source-line" id="L12"><a href="#L12">  12</a> import torch</span>
+<span class="source-line" id="L13"><a href="#L13">  13</a> from megatron.core import mpu</span>
+<span class="source-line" id="L14"><a href="#L14">  14</a> from megatron.core.distributed import DistributedDataParallel as DDP</span>
+<span class="source-line" id="L15"><a href="#L15">  15</a> from megatron.core.distributed import finalize_model_grads</span>
+<span class="source-line" id="L16"><a href="#L16">  16</a> from megatron.core.enums import ModelType</span>
+<span class="source-line" id="L17"><a href="#L17">  17</a> from megatron.core.models.gpt import GPTModel</span>
+<span class="source-line" id="L18"><a href="#L18">  18</a> from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer</span>
+<span class="source-line" id="L19"><a href="#L19">  19</a> from megatron.core.optimizer.optimizer import MegatronOptimizer</span>
+<span class="source-line" id="L20"><a href="#L20">  20</a> from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler</span>
+<span class="source-line" id="L21"><a href="#L21">  21</a> from megatron.core.pipeline_parallel import get_forward_backward_func</span>
+<span class="source-line" id="L22"><a href="#L22">  22</a> from megatron.core.utils import get_model_config</span>
+<span class="source-line" id="L23"><a href="#L23">  23</a> from megatron.training.global_vars import get_args</span>
+<span class="source-line" id="L24"><a href="#L24">  24</a> from megatron.training.training import get_model</span>
+<span class="source-line" id="L25"><a href="#L25">  25</a> from tqdm import tqdm</span>
+<span class="source-line" id="L26"><a href="#L26">  26</a> </span>
+<span class="source-line" id="L27"><a href="#L27">  27</a> try:</span>
+<span class="source-line" id="L28"><a href="#L28">  28</a>     from megatron.core.pipeline_parallel.utils import unwrap_model</span>
+<span class="source-line" id="L29"><a href="#L29">  29</a> except ImportError:</span>
+<span class="source-line" id="L30"><a href="#L30">  30</a>     from megatron.core.utils import unwrap_model</span>
+<span class="source-line" id="L31"><a href="#L31">  31</a> from slime.observability import logging_utils, train_metric_utils</span>
+<span class="source-line" id="L32"><a href="#L32">  32</a> from slime.utils.memory_utils import clear_memory</span>
+<span class="source-line" id="L33"><a href="#L33">  33</a> </span>
+<span class="source-line" id="L34"><a href="#L34">  34</a> from .checkpoint import load_checkpoint, save_checkpoint</span>
+<span class="source-line" id="L35"><a href="#L35">  35</a> from .data import DataIterator, get_batch</span>
+<span class="source-line" id="L36"><a href="#L36">  36</a> from .loss import ROLLOUT_TOP_P_TOKEN_KEYS, get_rollout_top_p_logprob_kwargs, loss_function</span>
+<span class="source-line" id="L37"><a href="#L37">  37</a> from .model_provider import get_model_provider_func</span>
+<span class="source-line" id="L38"><a href="#L38">  38</a> from .stateless_adam import StatelessAdam</span>
+<span class="source-line" id="L39"><a href="#L39">  39</a> </span>
+<span class="source-line" id="L40"><a href="#L40">  40</a> logger = logging.getLogger(__name__)</span>
+<span class="source-line" id="L41"><a href="#L41">  41</a> </span>
+<span class="source-line" id="L42"><a href="#L42">  42</a> </span>
+<span class="source-line" id="L43"><a href="#L43">  43</a> def _disable_tqdm_for_non_main_rank() -&gt; bool:</span>
+<span class="source-line" id="L44"><a href="#L44">  44</a>     return not (</span>
+<span class="source-line" id="L45"><a href="#L45">  45</a>         mpu.get_data_parallel_rank(with_context_parallel=True) == 0</span>
+<span class="source-line" id="L46"><a href="#L46">  46</a>         and mpu.get_tensor_model_parallel_rank() == 0</span>
+<span class="source-line" id="L47"><a href="#L47">  47</a>         and mpu.get_pipeline_model_parallel_rank() == mpu.get_pipeline_model_parallel_world_size() - 1</span>
+<span class="source-line" id="L48"><a href="#L48">  48</a>     )</span>
+<span class="source-line" id="L49"><a href="#L49">  49</a> </span>
+<span class="source-line" id="L50"><a href="#L50">  50</a> </span>
+<span class="source-line" id="L51"><a href="#L51">  51</a> def _should_update_microbatch_pbar(model) -&gt; bool:</span>
+<span class="source-line" id="L52"><a href="#L52">  52</a>     if _disable_tqdm_for_non_main_rank():</span>
+<span class="source-line" id="L53"><a href="#L53">  53</a>         return False</span>
+<span class="source-line" id="L54"><a href="#L54">  54</a> </span>
+<span class="source-line" id="L55"><a href="#L55">  55</a>     while hasattr(model, &quot;module&quot;):</span>
+<span class="source-line" id="L56"><a href="#L56">  56</a>         model = model.module</span>
+<span class="source-line" id="L57"><a href="#L57">  57</a>     vp_stage = getattr(model, &quot;vp_stage&quot;, None)</span>
+<span class="source-line" id="L58"><a href="#L58">  58</a>     if mpu.get_virtual_pipeline_model_parallel_world_size() is not None and vp_stage is not None:</span>
+<span class="source-line" id="L59"><a href="#L59">  59</a>         return mpu.is_pipeline_last_stage(ignore_virtual=False, vp_stage=vp_stage)</span>
+<span class="source-line" id="L60"><a href="#L60">  60</a>     return mpu.is_pipeline_last_stage(ignore_virtual=True)</span>
+<span class="source-line" id="L61"><a href="#L61">  61</a> </span>
+<span class="source-line" id="L62"><a href="#L62">  62</a> </span>
+<span class="source-line" id="L63"><a href="#L63">  63</a> def _wrap_forward_step_with_microbatch_pbar(forward_step_func, pbar):</span>
+<span class="source-line" id="L64"><a href="#L64">  64</a>     if pbar is None:</span>
+<span class="source-line" id="L65"><a href="#L65">  65</a>         return forward_step_func</span>
+<span class="source-line" id="L66"><a href="#L66">  66</a> </span>
+<span class="source-line" id="L67"><a href="#L67">  67</a>     def wrapped_forward_step(*args, **kwargs):</span>
+<span class="source-line" id="L68"><a href="#L68">  68</a>         result = forward_step_func(*args, **kwargs)</span>
+<span class="source-line" id="L69"><a href="#L69">  69</a>         model = args[1] if len(args) &gt; 1 else kwargs.get(&quot;model&quot;)</span>
+<span class="source-line" id="L70"><a href="#L70">  70</a>         if model is not None and _should_update_microbatch_pbar(model):</span>
+<span class="source-line" id="L71"><a href="#L71">  71</a>             pbar.update(1)</span>
+<span class="source-line" id="L72"><a href="#L72">  72</a>         return result</span>
+<span class="source-line" id="L73"><a href="#L73">  73</a> </span>
+<span class="source-line" id="L74"><a href="#L74">  74</a>     return wrapped_forward_step</span>
+<span class="source-line" id="L75"><a href="#L75">  75</a> </span>
+<span class="source-line" id="L76"><a href="#L76">  76</a> </span>
+<span class="source-line" id="L77"><a href="#L77">  77</a> def _with_rollout_top_p_token_keys(args: Namespace, keys: Sequence[str]) -&gt; list[str]:</span>
+<span class="source-line" id="L78"><a href="#L78">  78</a>     if args.rollout_top_p == 1.0:</span>
+<span class="source-line" id="L79"><a href="#L79">  79</a>         return list(keys)</span>
+<span class="source-line" id="L80"><a href="#L80">  80</a>     return [*keys, *ROLLOUT_TOP_P_TOKEN_KEYS]</span>
+<span class="source-line" id="L81"><a href="#L81">  81</a> </span>
+<span class="source-line" id="L82"><a href="#L82">  82</a> </span>
+<span class="source-line" id="L83"><a href="#L83">  83</a> def _iter_critic_output_layers(model: Sequence[DDP]):</span>
+<span class="source-line" id="L84"><a href="#L84">  84</a>     for chunk_id, module in enumerate(unwrap_model(model)):</span>
+<span class="source-line" id="L85"><a href="#L85">  85</a>         output_layer = getattr(module, &quot;output_layer&quot;, None)</span>
+<span class="source-line" id="L86"><a href="#L86">  86</a>         if output_layer is not None:</span>
+<span class="source-line" id="L87"><a href="#L87">  87</a>             yield chunk_id, output_layer</span>
+<span class="source-line" id="L88"><a href="#L88">  88</a> </span>
+<span class="source-line" id="L89"><a href="#L89">  89</a> </span>
+<span class="source-line" id="L90"><a href="#L90">  90</a> try:</span>
+<span class="source-line" id="L91"><a href="#L91">  91</a>     from megatron.training.checkpointing import get_load_checkpoint_path_by_args</span>
+<span class="source-line" id="L92"><a href="#L92">  92</a> except ImportError:</span>
+<span class="source-line" id="L93"><a href="#L93">  93</a> </span>
+<span class="source-line" id="L94"><a href="#L94">  94</a>     def get_load_checkpoint_path_by_args(args, load_arg=&quot;load&quot;):</span>
+<span class="source-line" id="L95"><a href="#L95">  95</a>         from megatron.training.checkpointing import (</span>
+<span class="source-line" id="L96"><a href="#L96">  96</a>             get_checkpoint_name,</span>
+<span class="source-line" id="L97"><a href="#L97">  97</a>             get_checkpoint_tracker_filename,</span>
+<span class="source-line" id="L98"><a href="#L98">  98</a>             isfile,</span>
+<span class="source-line" id="L99"><a href="#L99">  99</a>             read_metadata,</span>
+<span class="source-line" id="L100"><a href="#L100"> 100</a>         )</span>
+<span class="source-line" id="L101"><a href="#L101"> 101</a> </span>
+<span class="source-line" id="L102"><a href="#L102"> 102</a>         &quot;&quot;&quot;Get the checkpoint path based on the arguments.&quot;&quot;&quot;</span>
+<span class="source-line" id="L103"><a href="#L103"> 103</a>         load_dir = getattr(args, load_arg)</span>
+<span class="source-line" id="L104"><a href="#L104"> 104</a>         iteration, release = -1, False</span>
+<span class="source-line" id="L105"><a href="#L105"> 105</a>         tracker_filename = &quot;because load directory is not defined&quot;</span>
+<span class="source-line" id="L106"><a href="#L106"> 106</a>         if load_dir is not None:</span>
+<span class="source-line" id="L107"><a href="#L107"> 107</a>             tracker_filename = get_checkpoint_tracker_filename(load_dir)</span>
+<span class="source-line" id="L108"><a href="#L108"> 108</a>             if isfile(tracker_filename):</span>
+<span class="source-line" id="L109"><a href="#L109"> 109</a>                 iteration, release = read_metadata(tracker_filename)</span>
+<span class="source-line" id="L110"><a href="#L110"> 110</a>             else:</span>
+<span class="source-line" id="L111"><a href="#L111"> 111</a>                 load_dir, checkpoint_step = os.path.split(load_dir)</span>
+<span class="source-line" id="L112"><a href="#L112"> 112</a>                 if checkpoint_step == &quot;release&quot; or checkpoint_step.startswith(&quot;iter_&quot;):</span>
+<span class="source-line" id="L113"><a href="#L113"> 113</a>                     release = checkpoint_step == &quot;release&quot;</span>
+<span class="source-line" id="L114"><a href="#L114"> 114</a>                     if not release:</span>
+<span class="source-line" id="L115"><a href="#L115"> 115</a>                         iteration = int(checkpoint_step.split(&quot;_&quot;)[1])</span>
+<span class="source-line" id="L116"><a href="#L116"> 116</a> </span>
+<span class="source-line" id="L117"><a href="#L117"> 117</a>         # Allow user to specify the loaded iteration.</span>
+<span class="source-line" id="L118"><a href="#L118"> 118</a>         if getattr(args, &quot;ckpt_step&quot;, None):</span>
+<span class="source-line" id="L119"><a href="#L119"> 119</a>             iteration = args.ckpt_step</span>
+<span class="source-line" id="L120"><a href="#L120"> 120</a> </span>
+<span class="source-line" id="L121"><a href="#L121"> 121</a>         return get_checkpoint_name(load_dir, iteration, release, return_base_dir=True)</span>
+<span class="source-line" id="L122"><a href="#L122"> 122</a> </span>
+<span class="source-line" id="L123"><a href="#L123"> 123</a> </span>
+<span class="source-line" id="L124"><a href="#L124"> 124</a> def _critic_output_layer_needs_reinit(args: Namespace, model: Sequence[DDP], role: str) -&gt; bool:</span>
+<span class="source-line" id="L125"><a href="#L125"> 125</a>     if role != &quot;critic&quot; or args.load is None:</span>
+<span class="source-line" id="L126"><a href="#L126"> 126</a>         return False</span>
+<span class="source-line" id="L127"><a href="#L127"> 127</a> </span>
+<span class="source-line" id="L128"><a href="#L128"> 128</a>     from megatron.core.dist_checkpointing.serialization import load_tensors_metadata</span>
+<span class="source-line" id="L129"><a href="#L129"> 129</a> </span>
+<span class="source-line" id="L130"><a href="#L130"> 130</a>     checkpoint_path = Path(get_load_checkpoint_path_by_args(args))</span>
+<span class="source-line" id="L131"><a href="#L131"> 131</a>     if not (checkpoint_path / &quot;.metadata&quot;).is_file():</span>
+<span class="source-line" id="L132"><a href="#L132"> 132</a>         return False</span>
+<span class="source-line" id="L133"><a href="#L133"> 133</a> </span>
+<span class="source-line" id="L134"><a href="#L134"> 134</a>     checkpoint_metadata = load_tensors_metadata(str(checkpoint_path))</span>
+<span class="source-line" id="L135"><a href="#L135"> 135</a>     for _chunk_id, output_layer in _iter_critic_output_layers(model):</span>
+<span class="source-line" id="L136"><a href="#L136"> 136</a>         for name in (&quot;weight&quot;, &quot;bias&quot;):</span>
+<span class="source-line" id="L137"><a href="#L137"> 137</a>             param = getattr(output_layer, name, None)</span>
+<span class="source-line" id="L138"><a href="#L138"> 138</a>             if param is None:</span>
+<span class="source-line" id="L139"><a href="#L139"> 139</a>                 continue</span>
+<span class="source-line" id="L140"><a href="#L140"> 140</a> </span>
+<span class="source-line" id="L141"><a href="#L141"> 141</a>             param_name = f&quot;output_layer.{name}&quot;</span>
+<span class="source-line" id="L142"><a href="#L142"> 142</a>             ckpt_tensor_metadata = next(</span>
+<span class="source-line" id="L143"><a href="#L143"> 143</a>                 (</span>
+<span class="source-line" id="L144"><a href="#L144"> 144</a>                     tensor_metadata</span>
+<span class="source-line" id="L145"><a href="#L145"> 145</a>                     for key, tensor_metadata in checkpoint_metadata.items()</span>
+<span class="source-line" id="L146"><a href="#L146"> 146</a>                     if key == param_name or key.endswith(f&quot;.{param_name}&quot;)</span>
+<span class="source-line" id="L147"><a href="#L147"> 147</a>                 ),</span>
+<span class="source-line" id="L148"><a href="#L148"> 148</a>                 None,</span>
+<span class="source-line" id="L149"><a href="#L149"> 149</a>             )</span>
+<span class="source-line" id="L150"><a href="#L150"> 150</a>             expected_shape = tuple(param.shape)</span>
+<span class="source-line" id="L151"><a href="#L151"> 151</a>             checkpoint_shape = tuple(ckpt_tensor_metadata.global_shape) if ckpt_tensor_metadata is not None else None</span>
+<span class="source-line" id="L152"><a href="#L152"> 152</a>             if checkpoint_shape == expected_shape:</span>
+<span class="source-line" id="L153"><a href="#L153"> 153</a>                 continue</span>
+<span class="source-line" id="L154"><a href="#L154"> 154</a> </span>
+<span class="source-line" id="L155"><a href="#L155"> 155</a>             reason = (</span>
+<span class="source-line" id="L156"><a href="#L156"> 156</a>                 &quot;missing from checkpoint metadata&quot;</span>
+<span class="source-line" id="L157"><a href="#L157"> 157</a>                 if checkpoint_shape is None</span>
+<span class="source-line" id="L158"><a href="#L158"> 158</a>                 else f&quot;shape mismatch checkpoint={checkpoint_shape} runtime={expected_shape}&quot;</span>
+<span class="source-line" id="L159"><a href="#L159"> 159</a>             )</span>
+<span class="source-line" id="L160"><a href="#L160"> 160</a>             logger.warning(</span>
+<span class="source-line" id="L161"><a href="#L161"> 161</a>                 &quot;Will reinitialize critic %s after checkpoint load because it is %s&quot;,</span>
+<span class="source-line" id="L162"><a href="#L162"> 162</a>                 param_name,</span>
+<span class="source-line" id="L163"><a href="#L163"> 163</a>                 reason,</span>
+<span class="source-line" id="L164"><a href="#L164"> 164</a>             )</span>
+<span class="source-line" id="L165"><a href="#L165"> 165</a>             return True</span>
+<span class="source-line" id="L166"><a href="#L166"> 166</a> </span>
+<span class="source-line" id="L167"><a href="#L167"> 167</a>     return False</span>
+<span class="source-line" id="L168"><a href="#L168"> 168</a> </span>
+<span class="source-line" id="L169"><a href="#L169"> 169</a> </span>
+<span class="source-line" id="L170"><a href="#L170"> 170</a> @torch.no_grad()</span>
+<span class="source-line" id="L171"><a href="#L171"> 171</a> def _reinitialize_critic_output_layer(args: Namespace, model: Sequence[DDP]) -&gt; None:</span>
+<span class="source-line" id="L172"><a href="#L172"> 172</a>     init_method_std = getattr(args, &quot;init_method_std&quot;, None)</span>
+<span class="source-line" id="L173"><a href="#L173"> 173</a>     if init_method_std is None:</span>
+<span class="source-line" id="L174"><a href="#L174"> 174</a>         init_method_std = 0.02</span>
+<span class="source-line" id="L175"><a href="#L175"> 175</a>     for _chunk_id, output_layer in _iter_critic_output_layers(model):</span>
+<span class="source-line" id="L176"><a href="#L176"> 176</a>         output_layer.weight.data.normal_(mean=0.0, std=init_method_std)</span>
+<span class="source-line" id="L177"><a href="#L177"> 177</a>         if output_layer.bias is not None:</span>
+<span class="source-line" id="L178"><a href="#L178"> 178</a>             output_layer.bias.data.zero_()</span>
+<span class="source-line" id="L179"><a href="#L179"> 179</a> </span>
+<span class="source-line" id="L180"><a href="#L180"> 180</a> </span>
+<span class="source-line" id="L181"><a href="#L181"> 181</a> def get_optimizer_param_scheduler(args: Namespace, optimizer: MegatronOptimizer) -&gt; OptimizerParamScheduler:</span>
+<span class="source-line" id="L182"><a href="#L182"> 182</a>     &quot;&quot;&quot;Create and configure the optimizer learning-rate/weight-decay scheduler.</span>
+<span class="source-line" id="L183"><a href="#L183"> 183</a> </span>
+<span class="source-line" id="L184"><a href="#L184"> 184</a>     This configures iteration-based schedules derived from the global batch size</span>
+<span class="source-line" id="L185"><a href="#L185"> 185</a>     and run-time arguments.</span>
+<span class="source-line" id="L186"><a href="#L186"> 186</a> </span>
+<span class="source-line" id="L187"><a href="#L187"> 187</a>     Args:</span>
+<span class="source-line" id="L188"><a href="#L188"> 188</a>         args (Namespace): Training/runtime arguments (argparse namespace).</span>
+<span class="source-line" id="L189"><a href="#L189"> 189</a>         optimizer (MegatronOptimizer): Megatron optimizer bound to the model.</span>
+<span class="source-line" id="L190"><a href="#L190"> 190</a> </span>
+<span class="source-line" id="L191"><a href="#L191"> 191</a>     Returns:</span>
+<span class="source-line" id="L192"><a href="#L192"> 192</a>         OptimizerParamScheduler: Initialized scheduler bound to ``optimizer``.</span>
+<span class="source-line" id="L193"><a href="#L193"> 193</a>     &quot;&quot;&quot;</span>
+<span class="source-line" id="L194"><a href="#L194"> 194</a>     # Iteration-based training. ``train_iters`` is an estimate of the total</span>
+<span class="source-line" id="L195"><a href="#L195"> 195</a>     # number of training steps — it&#x27;s only used to size Megatron&#x27;s LR decay</span>
+<span class="source-line" id="L196"><a href="#L196"> 196</a>     # schedule (and ``lr_decay_iters`` defaults to it). With variable per-rollout</span>
+<span class="source-line" id="L197"><a href="#L197"> 197</a>     # sample counts (dynamic sampling / filtering / custom step splitter) the</span>
+<span class="source-line" id="L198"><a href="#L198"> 198</a>     # *actual* total can drift; the schedule still tracks the true progress via</span>
+<span class="source-line" id="L199"><a href="#L199"> 199</a>     # ``opt_param_scheduler.num_steps`` (samples consumed, also persisted across</span>
+<span class="source-line" id="L200"><a href="#L200"> 200</a>     # resume), so the worst case is the cosine/linear schedule reaches its</span>
+<span class="source-line" id="L201"><a href="#L201"> 201</a>     # plateau slightly early or late. Pass ``--lr-decay-iters`` explicitly if you</span>
+<span class="source-line" id="L202"><a href="#L202"> 202</a>     # need exact decay control.</span>
+<span class="source-line" id="L203"><a href="#L203"> 203</a>     args.train_iters = args.num_rollout * args.rollout_batch_size * args.n_samples_per_prompt // args.global_batch_size</span>
+<span class="source-line" id="L204"><a href="#L204"> 204</a>     if args.lr_decay_iters is None:</span>
+<span class="source-line" id="L205"><a href="#L205"> 205</a>         args.lr_decay_iters = args.train_iters</span>
+<span class="source-line" id="L206"><a href="#L206"> 206</a>     lr_decay_steps = args.lr_decay_iters * args.global_batch_size</span>
+<span class="source-line" id="L207"><a href="#L207"> 207</a>     wd_incr_steps = args.train_iters * args.global_batch_size</span>
+<span class="source-line" id="L208"><a href="#L208"> 208</a>     wsd_decay_steps = None</span>
+<span class="source-line" id="L209"><a href="#L209"> 209</a>     if args.lr_wsd_decay_iters is not None:</span>
+<span class="source-line" id="L210"><a href="#L210"> 210</a>         wsd_decay_steps = args.lr_wsd_decay_iters * args.global_batch_size</span>
+<span class="source-line" id="L211"><a href="#L211"> 211</a>     if args.lr_warmup_fraction is not None:</span>
+<span class="source-line" id="L212"><a href="#L212"> 212</a>         lr_warmup_steps = args.lr_warmup_fraction * lr_decay_steps</span>
+<span class="source-line" id="L213"><a href="#L213"> 213</a>     else:</span>
+<span class="source-line" id="L214"><a href="#L214"> 214</a>         lr_warmup_steps = args.lr_warmup_iters * args.global_batch_size</span>
+<span class="source-line" id="L215"><a href="#L215"> 215</a> </span>
+<span class="source-line" id="L216"><a href="#L216"> 216</a>     opt_param_scheduler = OptimizerParamScheduler(</span>
+<span class="source-line" id="L217"><a href="#L217"> 217</a>         optimizer,</span>
+<span class="source-line" id="L218"><a href="#L218"> 218</a>         init_lr=args.lr_warmup_init,</span>
+<span class="source-line" id="L219"><a href="#L219"> 219</a>         max_lr=args.lr,</span>
+<span class="source-line" id="L220"><a href="#L220"> 220</a>         min_lr=args.min_lr,</span>
+<span class="source-line" id="L221"><a href="#L221"> 221</a>         lr_warmup_steps=lr_warmup_steps,</span>
+<span class="source-line" id="L222"><a href="#L222"> 222</a>         lr_decay_steps=lr_decay_steps,</span>
+<span class="source-line" id="L223"><a href="#L223"> 223</a>         lr_decay_style=args.lr_decay_style,</span>
+<span class="source-line" id="L224"><a href="#L224"> 224</a>         start_wd=args.start_weight_decay,</span>
+<span class="source-line" id="L225"><a href="#L225"> 225</a>         end_wd=args.end_weight_decay,</span>
+<span class="source-line" id="L226"><a href="#L226"> 226</a>         wd_incr_steps=wd_incr_steps,</span>
+<span class="source-line" id="L227"><a href="#L227"> 227</a>         wd_incr_style=args.weight_decay_incr_style,</span>
+<span class="source-line" id="L228"><a href="#L228"> 228</a>         use_checkpoint_opt_param_scheduler=args.use_checkpoint_opt_param_scheduler,</span>
+<span class="source-line" id="L229"><a href="#L229"> 229</a>         override_opt_param_scheduler=args.override_opt_param_scheduler,</span>
+<span class="source-line" id="L230"><a href="#L230"> 230</a>         wsd_decay_steps=wsd_decay_steps,</span>
+<span class="source-line" id="L231"><a href="#L231"> 231</a>         lr_wsd_decay_style=args.lr_wsd_decay_style,</span>
+<span class="source-line" id="L232"><a href="#L232"> 232</a>     )</span>
+<span class="source-line" id="L233"><a href="#L233"> 233</a> </span>
+<span class="source-line" id="L234"><a href="#L234"> 234</a>     return opt_param_scheduler</span>
+<span class="source-line" id="L235"><a href="#L235"> 235</a> </span>
+<span class="source-line" id="L236"><a href="#L236"> 236</a> </span>
+<span class="source-line" id="L237"><a href="#L237"> 237</a> def _noop_init_state_fn(*args, **kwargs) -&gt; None:</span>
+<span class="source-line" id="L238"><a href="#L238"> 238</a>     return None</span>
+<span class="source-line" id="L239"><a href="#L239"> 239</a> </span>
+<span class="source-line" id="L240"><a href="#L240"> 240</a> </span>
+<span class="source-line" id="L241"><a href="#L241"> 241</a> def _disable_distributed_optimizer_state_initialization(optimizer: MegatronOptimizer) -&gt; None:</span>
+<span class="source-line" id="L242"><a href="#L242"> 242</a>     for megatron_optimizer in getattr(optimizer, &quot;chained_optimizers&quot;, [optimizer]):</span>
+<span class="source-line" id="L243"><a href="#L243"> 243</a>         if megatron_optimizer.__class__.__name__ == &quot;DistributedOptimizer&quot;:</span>
+<span class="source-line" id="L244"><a href="#L244"> 244</a>             megatron_optimizer.init_state_fn = _noop_init_state_fn</span>
+<span class="source-line" id="L245"><a href="#L245"> 245</a> </span>
+<span class="source-line" id="L246"><a href="#L246"> 246</a> </span>
+<span class="source-line" id="L247"><a href="#L247"> 247</a> @contextmanager</span>
+<span class="source-line" id="L248"><a href="#L248"> 248</a> def _patch_megatron_adam(adam_cls):</span>
+<span class="source-line" id="L249"><a href="#L249"> 249</a>     import megatron.core.optimizer as megatron_optimizer</span>
+<span class="source-line" id="L250"><a href="#L250"> 250</a>     import megatron.core.optimizer.distrib_optimizer as megatron_distrib_optimizer</span>
+<span class="source-line" id="L251"><a href="#L251"> 251</a> </span>
+<span class="source-line" id="L252"><a href="#L252"> 252</a>     missing = object()</span>
+<span class="source-line" id="L253"><a href="#L253"> 253</a>     old_adam = megatron_optimizer.Adam</span>
+<span class="source-line" id="L254"><a href="#L254"> 254</a>     old_cpu_adam = getattr(megatron_optimizer, &quot;CPUAdam&quot;, missing)</span>
+<span class="source-line" id="L255"><a href="#L255"> 255</a>     old_distrib_adam = megatron_distrib_optimizer.Adam</span>
+<span class="source-line" id="L256"><a href="#L256"> 256</a>     try:</span>
+<span class="source-line" id="L257"><a href="#L257"> 257</a>         megatron_optimizer.Adam = adam_cls</span>
+<span class="source-line" id="L258"><a href="#L258"> 258</a>         if old_cpu_adam is not missing:</span>
+<span class="source-line" id="L259"><a href="#L259"> 259</a>             megatron_optimizer.CPUAdam = adam_cls</span>
+<span class="source-line" id="L260"><a href="#L260"> 260</a>         megatron_distrib_optimizer.Adam = adam_cls</span>
+<span class="source-line" id="L261"><a href="#L261"> 261</a>         yield</span>
+<span class="source-line" id="L262"><a href="#L262"> 262</a>     finally:</span>
+<span class="source-line" id="L263"><a href="#L263"> 263</a>         megatron_optimizer.Adam = old_adam</span>
+<span class="source-line" id="L264"><a href="#L264"> 264</a>         if old_cpu_adam is not missing:</span>
+<span class="source-line" id="L265"><a href="#L265"> 265</a>             megatron_optimizer.CPUAdam = old_cpu_adam</span>
+<span class="source-line" id="L266"><a href="#L266"> 266</a>         megatron_distrib_optimizer.Adam = old_distrib_adam</span>
+<span class="source-line" id="L267"><a href="#L267"> 267</a> </span>
+<span class="source-line" id="L268"><a href="#L268"> 268</a> </span>
+<span class="source-line" id="L269"><a href="#L269"> 269</a> def setup_model_and_optimizer(</span>
+<span class="source-line" id="L270"><a href="#L270"> 270</a>     args: Namespace,</span>
+<span class="source-line" id="L271"><a href="#L271"> 271</a>     role: str = &quot;actor&quot;,</span>
+<span class="source-line" id="L272"><a href="#L272"> 272</a> ) -&gt; tuple[list[DDP], MegatronOptimizer | None, OptimizerParamScheduler | None]:</span>
+<span class="source-line" id="L273"><a href="#L273"> 273</a>     &quot;&quot;&quot;Build model(s), wrap with DDP, and construct optimizer and scheduler.</span>
+<span class="source-line" id="L274"><a href="#L274"> 274</a> </span>
+<span class="source-line" id="L275"><a href="#L275"> 275</a>     Args:</span>
+<span class="source-line" id="L276"><a href="#L276"> 276</a>         args (Namespace): Training/runtime arguments (argparse namespace).</span>
+<span class="source-line" id="L277"><a href="#L277"> 277</a>         role (str): Logical role of the model (e.g., &quot;actor&quot;, &quot;critic&quot;).</span>
+<span class="source-line" id="L278"><a href="#L278"> 278</a>         no_wd_decay_cond (Callable[..., bool] | None): Predicate to exclude</span>
+<span class="source-line" id="L279"><a href="#L279"> 279</a>             parameters from weight decay.</span>
+<span class="source-line" id="L280"><a href="#L280"> 280</a>         scale_lr_cond (Callable[..., bool] | None): Predicate to scale LR for</span>
+<span class="source-line" id="L281"><a href="#L281"> 281</a>             selected parameter groups.</span>
+<span class="source-line" id="L282"><a href="#L282"> 282</a>         lr_mult (float): Global learning-rate multiplier for the optimizer.</span>
+<span class="source-line" id="L283"><a href="#L283"> 283</a> </span>
+<span class="source-line" id="L284"><a href="#L284"> 284</a>     Returns:</span>
+<span class="source-line" id="L285"><a href="#L285"> 285</a>         tuple[list[DDP], MegatronOptimizer | None, OptimizerParamScheduler | None]:</span>
+<span class="source-line" id="L286"><a href="#L286"> 286</a>             - List of model chunks wrapped by ``DDP``.</span>
+<span class="source-line" id="L287"><a href="#L287"> 287</a>             - The constructed ``MegatronOptimizer`` instance.</span>
+<span class="source-line" id="L288"><a href="#L288"> 288</a>             - The learning-rate/weight-decay scheduler tied to the optimizer.</span>
+<span class="source-line" id="L289"><a href="#L289"> 289</a>     &quot;&quot;&quot;</span>
+<span class="source-line" id="L290"><a href="#L290"> 290</a>     assert not args.moe_use_upcycling</span>
+<span class="source-line" id="L291"><a href="#L291"> 291</a>     assert args.load is not None or args.pretrained_checkpoint is not None</span>
+<span class="source-line" id="L292"><a href="#L292"> 292</a> </span>
+<span class="source-line" id="L293"><a href="#L293"> 293</a>     model = get_model(get_model_provider_func(args, role), ModelType.encoder_or_decoder)</span>
+<span class="source-line" id="L294"><a href="#L294"> 294</a> </span>
+<span class="source-line" id="L295"><a href="#L295"> 295</a>     if args.num_rollout == 0:</span>
+<span class="source-line" id="L296"><a href="#L296"> 296</a>         args.no_load_optim = True</span>
+<span class="source-line" id="L297"><a href="#L297"> 297</a>         return model, None, None</span>
+<span class="source-line" id="L298"><a href="#L298"> 298</a> </span>
+<span class="source-line" id="L299"><a href="#L299"> 299</a>     # Optimizer</span>
+<span class="source-line" id="L300"><a href="#L300"> 300</a>     kwargs = {}</span>
+<span class="source-line" id="L301"><a href="#L301"> 301</a>     for f in dataclasses.fields(OptimizerConfig):</span>
+<span class="source-line" id="L302"><a href="#L302"> 302</a>         if hasattr(args, f.name):</span>
+<span class="source-line" id="L303"><a href="#L303"> 303</a>             kwargs[f.name] = getattr(args, f.name)</span>
+<span class="source-line" id="L304"><a href="#L304"> 304</a>     config = OptimizerConfig(**kwargs)</span>
+<span class="source-line" id="L305"><a href="#L305"> 305</a>     config.timers = None</span>
+<span class="source-line" id="L306"><a href="#L306"> 306</a> </span>
+<span class="source-line" id="L307"><a href="#L307"> 307</a>     if args.use_stateless_adam:</span>
+<span class="source-line" id="L308"><a href="#L308"> 308</a>         assert config.optimizer == &quot;adam&quot;, &quot;Stateless Adam only supports --optimizer adam.&quot;</span>
+<span class="source-line" id="L309"><a href="#L309"> 309</a>         assert args.no_save_optim, &quot;Stateless Adam does not save Adam moment states. Please set --no-save-optim.&quot;</span>
+<span class="source-line" id="L310"><a href="#L310"> 310</a> </span>
+<span class="source-line" id="L311"><a href="#L311"> 311</a>     optimizer_context = _patch_megatron_adam(StatelessAdam) if args.use_stateless_adam else nullcontext()</span>
+<span class="source-line" id="L312"><a href="#L312"> 312</a>     with optimizer_context:</span>
+<span class="source-line" id="L313"><a href="#L313"> 313</a>         optimizer = get_megatron_optimizer(</span>
+<span class="source-line" id="L314"><a href="#L314"> 314</a>             config=config,</span>
+<span class="source-line" id="L315"><a href="#L315"> 315</a>             model_chunks=model,</span>
+<span class="source-line" id="L316"><a href="#L316"> 316</a>             use_gloo_process_groups=args.enable_gloo_process_groups,</span>
+<span class="source-line" id="L317"><a href="#L317"> 317</a>         )</span>
+<span class="source-line" id="L318"><a href="#L318"> 318</a>     if args.use_stateless_adam:</span>
+<span class="source-line" id="L319"><a href="#L319"> 319</a>         _disable_distributed_optimizer_state_initialization(optimizer)</span>
+<span class="source-line" id="L320"><a href="#L320"> 320</a>     opt_param_scheduler = get_optimizer_param_scheduler(args, optimizer)</span>
+<span class="source-line" id="L321"><a href="#L321"> 321</a>     return model, optimizer, opt_param_scheduler</span>
+<span class="source-line" id="L322"><a href="#L322"> 322</a> </span>
+<span class="source-line" id="L323"><a href="#L323"> 323</a> </span>
+<span class="source-line" id="L324"><a href="#L324"> 324</a> def enable_forward_pre_hook(model_chunks: Sequence[DDP]) -&gt; None:</span>
+<span class="source-line" id="L325"><a href="#L325"> 325</a>     &quot;&quot;&quot;Enable forward pre-hooks for provided DDP-wrapped model chunks.</span>
+<span class="source-line" id="L326"><a href="#L326"> 326</a> </span>
+<span class="source-line" id="L327"><a href="#L327"> 327</a>     Args:</span>
+<span class="source-line" id="L328"><a href="#L328"> 328</a>         model_chunks (Sequence[DDP]): Sequence of DDP modules to enable hooks on.</span>
+<span class="source-line" id="L329"><a href="#L329"> 329</a>     &quot;&quot;&quot;</span>
+<span class="source-line" id="L330"><a href="#L330"> 330</a>     for model_chunk in model_chunks:</span>
+<span class="source-line" id="L331"><a href="#L331"> 331</a>         assert isinstance(model_chunk, DDP)</span>
+<span class="source-line" id="L332"><a href="#L332"> 332</a>         model_chunk.enable_forward_pre_hook()</span>
+<span class="source-line" id="L333"><a href="#L333"> 333</a> </span>
+<span class="source-line" id="L334"><a href="#L334"> 334</a> </span>
+<span class="source-line" id="L335"><a href="#L335"> 335</a> def disable_forward_pre_hook(model_chunks: Sequence[DDP], param_sync: bool = True) -&gt; None:</span>
+<span class="source-line" id="L336"><a href="#L336"> 336</a>     &quot;&quot;&quot;Disable forward pre-hooks for provided DDP-wrapped model chunks.</span>
+<span class="source-line" id="L337"><a href="#L337"> 337</a> </span>
+<span class="source-line" id="L338"><a href="#L338"> 338</a>     Args:</span>
+<span class="source-line" id="L339"><a href="#L339"> 339</a>         model_chunks (Sequence[DDP]): Sequence of DDP modules to disable hooks on.</span>
+<span class="source-line" id="L340"><a href="#L340"> 340</a>         param_sync (bool): Whether to synchronize parameters when disabling.</span>
+<span class="source-line" id="L341"><a href="#L341"> 341</a>     &quot;&quot;&quot;</span>
+<span class="source-line" id="L342"><a href="#L342"> 342</a>     for model_chunk in model_chunks:</span>
+<span class="source-line" id="L343"><a href="#L343"> 343</a>         assert isinstance(model_chunk, DDP)</span>
+<span class="source-line" id="L344"><a href="#L344"> 344</a>         model_chunk.disable_forward_pre_hook(param_sync=param_sync)</span>
+<span class="source-line" id="L345"><a href="#L345"> 345</a> </span>
+<span class="source-line" id="L346"><a href="#L346"> 346</a> </span>
+<span class="source-line" id="L347"><a href="#L347"> 347</a> @torch.no_grad()</span>
+<span class="source-line" id="L348"><a href="#L348"> 348</a> def forward_only(</span>
+<span class="source-line" id="L349"><a href="#L349"> 349</a>     f: Callable[..., dict[str, list[torch.Tensor]]],</span>
+<span class="source-line" id="L350"><a href="#L350"> 350</a>     args: Namespace,</span>
+<span class="source-line" id="L351"><a href="#L351"> 351</a>     model: Sequence[DDP],</span>
+<span class="source-line" id="L352"><a href="#L352"> 352</a>     data_iterator: Sequence[DataIterator],</span>
+<span class="source-line" id="L353"><a href="#L353"> 353</a>     num_microbatches: Sequence[int],</span>
+<span class="source-line" id="L354"><a href="#L354"> 354</a>     store_prefix: str = &quot;&quot;,</span>
+<span class="source-line" id="L355"><a href="#L355"> 355</a>     use_rollout_top_p_replay: bool = False,</span>
+<span class="source-line" id="L356"><a href="#L356"> 356</a> ) -&gt; dict[str, list[torch.Tensor]]:</span>
+<span class="source-line" id="L357"><a href="#L357"> 357</a>     &quot;&quot;&quot;Run forward passes only and collect non-loss outputs (e.g., logprobs).</span>
+<span class="source-line" id="L358"><a href="#L358"> 358</a> </span>
+<span class="source-line" id="L359"><a href="#L359"> 359</a>     The model is put into evaluation mode, a forward-only pipeline pass is</span>
+<span class="source-line" id="L360"><a href="#L360"> 360</a>     executed, and relevant outputs are aggregated and returned.</span>
+<span class="source-line" id="L361"><a href="#L361"> 361</a> </span>
+<span class="source-line" id="L362"><a href="#L362"> 362</a>     Args:</span>
+<span class="source-line" id="L363"><a href="#L363"> 363</a>         f (Callable[..., dict[str, list[torch.Tensor]]]): Post-forward callback used to</span>
+<span class="source-line" id="L364"><a href="#L364"> 364</a>             compute and package outputs to collect. This should accept a logits</span>
+<span class="source-line" id="L365"><a href="#L365"> 365</a>             tensor as its first positional argument and additional keyword-only</span>
+<span class="source-line" id="L366"><a href="#L366"> 366</a>             arguments; see ``get_log_probs_and_entropy``/``get_values`` in</span>
+<span class="source-line" id="L367"><a href="#L367"> 367</a>             ``megatron_utils.loss`` for examples. It will be partially applied</span>
+<span class="source-line" id="L368"><a href="#L368"> 368</a>             so that the callable returned from the internal forward step only</span>
+<span class="source-line" id="L369"><a href="#L369"> 369</a>             requires the logits tensor.</span>
+<span class="source-line" id="L370"><a href="#L370"> 370</a>         args (Namespace): Runtime arguments.</span>
+<span class="source-line" id="L371"><a href="#L371"> 371</a>         model (Sequence[DDP]): Sequence of DDP-wrapped model chunks.</span>
+<span class="source-line" id="L372"><a href="#L372"> 372</a>         data_iterator (Sequence[DataIterator]): Iterable(s) yielding batches for inference.</span>
+<span class="source-line" id="L373"><a href="#L373"> 373</a>         num_microbatches (Sequence[int]): Number of microbatches per rollout step.</span>
+<span class="source-line" id="L374"><a href="#L374"> 374</a>         store_prefix (str): Prefix to prepend to stored output keys.</span>
+<span class="source-line" id="L375"><a href="#L375"> 375</a>         use_rollout_top_p_replay (bool): Whether to pass rollout top-p token sets</span>
+<span class="source-line" id="L376"><a href="#L376"> 376</a>             to the post-forward log-prob callback when top-p rollout is enabled.</span>
+<span class="source-line" id="L377"><a href="#L377"> 377</a> </span>
+<span class="source-line" id="L378"><a href="#L378"> 378</a>     Returns:</span>
+<span class="source-line" id="L379"><a href="#L379"> 379</a>         dict[str, list[torch.Tensor]]: Aggregated outputs keyed by ``store_prefix + key``.</span>
+<span class="source-line" id="L380"><a href="#L380"> 380</a>     &quot;&quot;&quot;</span>
+<span class="source-line" id="L381"><a href="#L381"> 381</a> </span>
+<span class="source-line" id="L382"><a href="#L382"> 382</a>     # reset data iterator</span>
+<span class="source-line" id="L383"><a href="#L383"> 383</a>     for iterator in data_iterator:</span>
+<span class="source-line" id="L384"><a href="#L384"> 384</a>         iterator.reset()</span>
+<span class="source-line" id="L385"><a href="#L385"> 385</a> </span>
+<span class="source-line" id="L386"><a href="#L386"> 386</a>     config = get_model_config(model[0])</span>
+<span class="source-line" id="L387"><a href="#L387"> 387</a>     batch_keys = [</span>
+<span class="source-line" id="L388"><a href="#L388"> 388</a>         &quot;tokens&quot;,</span>
+<span class="source-line" id="L389"><a href="#L389"> 389</a>         &quot;loss_masks&quot;,</span>
+<span class="source-line" id="L390"><a href="#L390"> 390</a>         &quot;multimodal_train_inputs&quot;,</span>
+<span class="source-line" id="L391"><a href="#L391"> 391</a>         &quot;total_lengths&quot;,</span>
+<span class="source-line" id="L392"><a href="#L392"> 392</a>         &quot;response_lengths&quot;,</span>
+<span class="source-line" id="L393"><a href="#L393"> 393</a>     ]</span>
+<span class="source-line" id="L394"><a href="#L394"> 394</a>     if use_rollout_top_p_replay:</span>
+<span class="source-line" id="L395"><a href="#L395"> 395</a>         batch_keys = _with_rollout_top_p_token_keys(args, batch_keys)</span>
+<span class="source-line" id="L396"><a href="#L396"> 396</a> </span>
+<span class="source-line" id="L397"><a href="#L397"> 397</a>     def forward_step(</span>
+<span class="source-line" id="L398"><a href="#L398"> 398</a>         data_iterator: DataIterator, model: GPTModel, return_schedule_plan: bool = False</span>
+<span class="source-line" id="L399"><a href="#L399"> 399</a>     ) -&gt; tuple[torch.Tensor, Callable[[torch.Tensor], dict[str, list[torch.Tensor]]]]:</span>
+<span class="source-line" id="L400"><a href="#L400"> 400</a>         &quot;&quot;&quot;Forward step used by Megatron&#x27;s pipeline engine.</span>
+<span class="source-line" id="L401"><a href="#L401"> 401</a> </span>
+<span class="source-line" id="L402"><a href="#L402"> 402</a>         Args:</span>
+<span class="source-line" id="L403"><a href="#L403"> 403</a>             data_iterator (DataIterator): Input data iterator.</span>
+<span class="source-line" id="L404"><a href="#L404"> 404</a>             model (GPTModel): The GPT model chunk to execute.</span>
+<span class="source-line" id="L405"><a href="#L405"> 405</a> </span>
+<span class="source-line" id="L406"><a href="#L406"> 406</a>         Returns:</span>
+<span class="source-line" id="L407"><a href="#L407"> 407</a>             tuple[torch.Tensor, Callable[[torch.Tensor], dict[str, list[torch.Tensor]]]]:</span>
+<span class="source-line" id="L408"><a href="#L408"> 408</a>             Output tensor(s) and a callable that computes and packages results</span>
+<span class="source-line" id="L409"><a href="#L409"> 409</a>             to be collected by the engine.</span>
+<span class="source-line" id="L410"><a href="#L410"> 410</a>         &quot;&quot;&quot;</span>
+<span class="source-line" id="L411"><a href="#L411"> 411</a> </span>
+<span class="source-line" id="L412"><a href="#L412"> 412</a>         assert not return_schedule_plan, &quot;forward_only step should never return schedule plan&quot;</span>
+<span class="source-line" id="L413"><a href="#L413"> 413</a> </span>
+<span class="source-line" id="L414"><a href="#L414"> 414</a>         # Get the batch.</span>
+<span class="source-line" id="L415"><a href="#L415"> 415</a>         batch = get_batch(</span>
+<span class="source-line" id="L416"><a href="#L416"> 416</a>             data_iterator,</span>
+<span class="source-line" id="L417"><a href="#L417"> 417</a>             batch_keys,</span>
+<span class="source-line" id="L418"><a href="#L418"> 418</a>             args.data_pad_size_multiplier,</span>
+<span class="source-line" id="L419"><a href="#L419"> 419</a>             args.allgather_cp,</span>
+<span class="source-line" id="L420"><a href="#L420"> 420</a>         )</span>
+<span class="source-line" id="L421"><a href="#L421"> 421</a>         unconcat_tokens = batch[&quot;unconcat_tokens&quot;]</span>
+<span class="source-line" id="L422"><a href="#L422"> 422</a>         tokens = batch[&quot;tokens&quot;]</span>
+<span class="source-line" id="L423"><a href="#L423"> 423</a>         packed_seq_params = batch[&quot;packed_seq_params&quot;]</span>
+<span class="source-line" id="L424"><a href="#L424"> 424</a>         total_lengths = batch[&quot;total_lengths&quot;]</span>
+<span class="source-line" id="L425"><a href="#L425"> 425</a>         response_lengths = batch[&quot;response_lengths&quot;]</span>
+<span class="source-line" id="L426"><a href="#L426"> 426</a>         forward_kwargs = {</span>
+<span class="source-line" id="L427"><a href="#L427"> 427</a>             &quot;input_ids&quot;: tokens,</span>
+<span class="source-line" id="L428"><a href="#L428"> 428</a>             &quot;position_ids&quot;: None,</span>
+<span class="source-line" id="L429"><a href="#L429"> 429</a>             &quot;attention_mask&quot;: None,</span>
+<span class="source-line" id="L430"><a href="#L430"> 430</a>             &quot;labels&quot;: None,</span>
+<span class="source-line" id="L431"><a href="#L431"> 431</a>             &quot;packed_seq_params&quot;: packed_seq_params,</span>
+<span class="source-line" id="L432"><a href="#L432"> 432</a>             &quot;loss_mask&quot;: batch[&quot;full_loss_masks&quot;],</span>
+<span class="source-line" id="L433"><a href="#L433"> 433</a>         }</span>
+<span class="source-line" id="L434"><a href="#L434"> 434</a>         if batch[&quot;multimodal_train_inputs&quot;] is not None:</span>
+<span class="source-line" id="L435"><a href="#L435"> 435</a>             forward_kwargs.update(batch[&quot;multimodal_train_inputs&quot;])</span>
+<span class="source-line" id="L436"><a href="#L436"> 436</a>         output_tensor = model(**forward_kwargs)</span>
+<span class="source-line" id="L437"><a href="#L437"> 437</a> </span>
+<span class="source-line" id="L438"><a href="#L438"> 438</a>         output_kwargs = {</span>
+<span class="source-line" id="L439"><a href="#L439"> 439</a>             &quot;args&quot;: args,</span>
+<span class="source-line" id="L440"><a href="#L440"> 440</a>             &quot;unconcat_tokens&quot;: unconcat_tokens,</span>
+<span class="source-line" id="L441"><a href="#L441"> 441</a>             &quot;total_lengths&quot;: total_lengths,</span>
+<span class="source-line" id="L442"><a href="#L442"> 442</a>             &quot;response_lengths&quot;: response_lengths,</span>
+<span class="source-line" id="L443"><a href="#L443"> 443</a>             &quot;with_entropy&quot;: args.use_rollout_entropy,</span>
+<span class="source-line" id="L444"><a href="#L444"> 444</a>         }</span>
+<span class="source-line" id="L445"><a href="#L445"> 445</a>         if use_rollout_top_p_replay:</span>
+<span class="source-line" id="L446"><a href="#L446"> 446</a>             output_kwargs.update(get_rollout_top_p_logprob_kwargs(args, batch))</span>
+<span class="source-line" id="L447"><a href="#L447"> 447</a> </span>
+<span class="source-line" id="L448"><a href="#L448"> 448</a>         return output_tensor, partial(f, **output_kwargs)</span>
+<span class="source-line" id="L449"><a href="#L449"> 449</a> </span>
+<span class="source-line" id="L450"><a href="#L450"> 450</a>     # Turn on evaluation mode which disables dropout.</span>
+<span class="source-line" id="L451"><a href="#L451"> 451</a>     for model_module in model:</span>
+<span class="source-line" id="L452"><a href="#L452"> 452</a>         model_module.eval()</span>
+<span class="source-line" id="L453"><a href="#L453"> 453</a> </span>
+<span class="source-line" id="L454"><a href="#L454"> 454</a>     if args.custom_megatron_before_log_prob_hook_path:</span>
+<span class="source-line" id="L455"><a href="#L455"> 455</a>         from slime.utils.misc import load_function</span>
+<span class="source-line" id="L456"><a href="#L456"> 456</a> </span>
+<span class="source-line" id="L457"><a href="#L457"> 457</a>         custom_before_log_prob_hook = load_function(args.custom_megatron_before_log_prob_hook_path)</span>
+<span class="source-line" id="L458"><a href="#L458"> 458</a>         custom_before_log_prob_hook(args, model, store_prefix)</span>
+<span class="source-line" id="L459"><a href="#L459"> 459</a> </span>
+<span class="source-line" id="L460"><a href="#L460"> 460</a>     forward_backward_func = get_forward_backward_func()</span>
+<span class="source-line" id="L461"><a href="#L461"> 461</a>     # Don&#x27;t care about timing during evaluation</span>
+<span class="source-line" id="L462"><a href="#L462"> 462</a>     config.timers = None</span>
+<span class="source-line" id="L463"><a href="#L463"> 463</a>     forward_data_store = []</span>
+<span class="source-line" id="L464"><a href="#L464"> 464</a>     num_steps_per_rollout = len(num_microbatches)</span>
+<span class="source-line" id="L465"><a href="#L465"> 465</a>     microbatch_pbar = tqdm(</span>
+<span class="source-line" id="L466"><a href="#L466"> 466</a>         total=sum(num_microbatches),</span>
+<span class="source-line" id="L467"><a href="#L467"> 467</a>         desc=f&quot;{(store_prefix or getattr(model[0], &#x27;role&#x27;, &#x27;actor&#x27;)).rstrip(&#x27;_&#x27;)} forward&quot;,</span>
+<span class="source-line" id="L468"><a href="#L468"> 468</a>         unit=&quot;microbatch&quot;,</span>
+<span class="source-line" id="L469"><a href="#L469"> 469</a>         dynamic_ncols=True,</span>
+<span class="source-line" id="L470"><a href="#L470"> 470</a>         leave=False,</span>
+<span class="source-line" id="L471"><a href="#L471"> 471</a>         disable=_disable_tqdm_for_non_main_rank(),</span>
+<span class="source-line" id="L472"><a href="#L472"> 472</a>     )</span>
+<span class="source-line" id="L473"><a href="#L473"> 473</a>     forward_step_with_progress = _wrap_forward_step_with_microbatch_pbar(forward_step, microbatch_pbar)</span>
+<span class="source-line" id="L474"><a href="#L474"> 474</a>     for step_id in range(num_steps_per_rollout):</span>
+<span class="source-line" id="L475"><a href="#L475"> 475</a>         forward_data_store += forward_backward_func(</span>
+<span class="source-line" id="L476"><a href="#L476"> 476</a>             forward_step_func=forward_step_with_progress,</span>
+<span class="source-line" id="L477"><a href="#L477"> 477</a>             data_iterator=data_iterator,</span>
+<span class="source-line" id="L478"><a href="#L478"> 478</a>             model=model,</span>
+<span class="source-line" id="L479"><a href="#L479"> 479</a>             num_microbatches=num_microbatches[step_id],</span>
+<span class="source-line" id="L480"><a href="#L480"> 480</a>             seq_length=args.seq_length,</span>
+<span class="source-line" id="L481"><a href="#L481"> 481</a>             micro_batch_size=args.micro_batch_size,</span>
+<span class="source-line" id="L482"><a href="#L482"> 482</a>             forward_only=True,</span>
+<span class="source-line" id="L483"><a href="#L483"> 483</a>         )</span>
+<span class="source-line" id="L484"><a href="#L484"> 484</a>     microbatch_pbar.close()</span>
+<span class="source-line" id="L485"><a href="#L485"> 485</a> </span>
+<span class="source-line" id="L486"><a href="#L486"> 486</a>     # Move model back to the train mode.</span>
+<span class="source-line" id="L487"><a href="#L487"> 487</a>     for model_module in model:</span>
+<span class="source-line" id="L488"><a href="#L488"> 488</a>         model_module.train()</span>
+<span class="source-line" id="L489"><a href="#L489"> 489</a> </span>
+<span class="source-line" id="L490"><a href="#L490"> 490</a>     rollout_data = {}</span>
+<span class="source-line" id="L491"><a href="#L491"> 491</a>     # Store the results on the last stage</span>
+<span class="source-line" id="L492"><a href="#L492"> 492</a>     if mpu.is_pipeline_last_stage():</span>
+<span class="source-line" id="L493"><a href="#L493"> 493</a>         keys = forward_data_store[0].keys()</span>
+<span class="source-line" id="L494"><a href="#L494"> 494</a>         for key in keys:</span>
+<span class="source-line" id="L495"><a href="#L495"> 495</a>             values = []</span>
+<span class="source-line" id="L496"><a href="#L496"> 496</a>             for value in forward_data_store:</span>
+<span class="source-line" id="L497"><a href="#L497"> 497</a>                 assert isinstance(value[key], list)</span>
+<span class="source-line" id="L498"><a href="#L498"> 498</a>                 values += value[key]</span>
+<span class="source-line" id="L499"><a href="#L499"> 499</a> </span>
+<span class="source-line" id="L500"><a href="#L500"> 500</a>             if args.use_dynamic_batch_size:</span>
+<span class="source-line" id="L501"><a href="#L501"> 501</a>                 # TODO: This is ugly... Find a better way to make the data have the same order.</span>
+<span class="source-line" id="L502"><a href="#L502"> 502</a>                 # TODO: move this out of the loop.</span>
+<span class="source-line" id="L503"><a href="#L503"> 503</a>                 origin_values = [None] * len(values)</span>
+<span class="source-line" id="L504"><a href="#L504"> 504</a>                 origin_indices = sum(data_iterator[0].micro_batch_indices, [])</span>
+<span class="source-line" id="L505"><a href="#L505"> 505</a>                 for value, origin_index in zip(values, origin_indices, strict=False):</span>
+<span class="source-line" id="L506"><a href="#L506"> 506</a>                     origin_values[origin_index] = value</span>
+<span class="source-line" id="L507"><a href="#L507"> 507</a>                 values = origin_values</span>
+<span class="source-line" id="L508"><a href="#L508"> 508</a>             rollout_data[f&quot;{store_prefix}{key}&quot;] = values</span>
+<span class="source-line" id="L509"><a href="#L509"> 509</a>     return rollout_data</span>
+<span class="source-line" id="L510"><a href="#L510"> 510</a> </span>
+<span class="source-line" id="L511"><a href="#L511"> 511</a> </span>
+<span class="source-line" id="L512"><a href="#L512"> 512</a> def train_one_step(</span>
+<span class="source-line" id="L513"><a href="#L513"> 513</a>     args: Namespace,</span>
+<span class="source-line" id="L514"><a href="#L514"> 514</a>     rollout_id: int,</span>
+<span class="source-line" id="L515"><a href="#L515"> 515</a>     step_id: int,</span>
+<span class="source-line" id="L516"><a href="#L516"> 516</a>     data_iterator: Sequence[DataIterator],</span>
+<span class="source-line" id="L517"><a href="#L517"> 517</a>     model: Sequence[DDP],</span>
+<span class="source-line" id="L518"><a href="#L518"> 518</a>     optimizer: MegatronOptimizer,</span>
+<span class="source-line" id="L519"><a href="#L519"> 519</a>     opt_param_scheduler: OptimizerParamScheduler,</span>
+<span class="source-line" id="L520"><a href="#L520"> 520</a>     num_microbatches: int,</span>
+<span class="source-line" id="L521"><a href="#L521"> 521</a>     step_global_batch_size: int,</span>
+<span class="source-line" id="L522"><a href="#L522"> 522</a>     microbatch_pbar=None,</span>
+<span class="source-line" id="L523"><a href="#L523"> 523</a> ) -&gt; tuple[dict[str, float], float]:</span>
+<span class="source-line" id="L524"><a href="#L524"> 524</a>     &quot;&quot;&quot;Execute a single pipeline-parallel training step.</span>
+<span class="source-line" id="L525"><a href="#L525"> 525</a> </span>
+<span class="source-line" id="L526"><a href="#L526"> 526</a>     Runs forward/backward over ``num_microbatches``, applies optimizer step and</span>
+<span class="source-line" id="L527"><a href="#L527"> 527</a>     one scheduler step when gradients are valid.</span>
+<span class="source-line" id="L528"><a href="#L528"> 528</a> </span>
+<span class="source-line" id="L529"><a href="#L529"> 529</a>     Args:</span>
+<span class="source-line" id="L530"><a href="#L530"> 530</a>         args (Namespace): Runtime arguments.</span>
+<span class="source-line" id="L531"><a href="#L531"> 531</a>         rollout_id (int): Rollout identifier.</span>
+<span class="source-line" id="L532"><a href="#L532"> 532</a>         step_id (int): Step index within the current rollout.</span>
+<span class="source-line" id="L533"><a href="#L533"> 533</a>         data_iterator (Sequence[DataIterator]): Iterable(s) yielding training batches.</span>
+<span class="source-line" id="L534"><a href="#L534"> 534</a>         model (Sequence[DDP]): Sequence of DDP-wrapped model chunks.</span>
+<span class="source-line" id="L535"><a href="#L535"> 535</a>         optimizer (MegatronOptimizer): Optimizer instance.</span>
+<span class="source-line" id="L536"><a href="#L536"> 536</a>         opt_param_scheduler (OptimizerParamScheduler): LR/WD scheduler.</span>
+<span class="source-line" id="L537"><a href="#L537"> 537</a>         num_microbatches (int): Number of microbatches to process.</span>
+<span class="source-line" id="L538"><a href="#L538"> 538</a>         step_global_batch_size (int): Rollout count for this training step</span>
+<span class="source-line" id="L539"><a href="#L539"> 539</a>             (total across DP; one &quot;rollout&quot; = one execution of one of the</span>
+<span class="source-line" id="L540"><a href="#L540"> 540</a>             ``n_samples_per_prompt`` rollouts, which may emit &gt;1 training</span>
+<span class="source-line" id="L541"><a href="#L541"> 541</a>             sample under compact / subagent). Used both as the loss</span>
+<span class="source-line" id="L542"><a href="#L542"> 542</a>             normalizer inside the closure and as the LR scheduler</span>
+<span class="source-line" id="L543"><a href="#L543"> 543</a>             ``increment``. In the common case (1 rollout = 1 sample) this</span>
+<span class="source-line" id="L544"><a href="#L544"> 544</a>             equals the per-step sample count, so behavior is unchanged.</span>
+<span class="source-line" id="L545"><a href="#L545"> 545</a> </span>
+<span class="source-line" id="L546"><a href="#L546"> 546</a>     Returns:</span>
+<span class="source-line" id="L547"><a href="#L547"> 547</a>         tuple[dict[str, float], float]: Reduced loss dictionary (last stage only)</span>
+<span class="source-line" id="L548"><a href="#L548"> 548</a>         and gradient norm for logging.</span>
+<span class="source-line" id="L549"><a href="#L549"> 549</a>     &quot;&quot;&quot;</span>
+<span class="source-line" id="L550"><a href="#L550"> 550</a>     args = get_args()</span>
+<span class="source-line" id="L551"><a href="#L551"> 551</a> </span>
+<span class="source-line" id="L552"><a href="#L552"> 552</a>     # Set grad to zero.</span>
+<span class="source-line" id="L553"><a href="#L553"> 553</a>     for model_chunk in model:</span>
+<span class="source-line" id="L554"><a href="#L554"> 554</a>         model_chunk.zero_grad_buffer()</span>
+<span class="source-line" id="L555"><a href="#L555"> 555</a>     optimizer.zero_grad()</span>
+<span class="source-line" id="L556"><a href="#L556"> 556</a> </span>
+<span class="source-line" id="L557"><a href="#L557"> 557</a>     if args.custom_megatron_before_train_step_hook_path:</span>
+<span class="source-line" id="L558"><a href="#L558"> 558</a>         from slime.utils.misc import load_function</span>
+<span class="source-line" id="L559"><a href="#L559"> 559</a> </span>
+<span class="source-line" id="L560"><a href="#L560"> 560</a>         custom_before_train_step_hook = load_function(args.custom_megatron_before_train_step_hook_path)</span>
+<span class="source-line" id="L561"><a href="#L561"> 561</a>         custom_before_train_step_hook(args, rollout_id, step_id, model, optimizer, opt_param_scheduler)</span>
+<span class="source-line" id="L562"><a href="#L562"> 562</a> </span>
+<span class="source-line" id="L563"><a href="#L563"> 563</a>     def forward_step(data_iterator: DataIterator, model: GPTModel, return_schedule_plan: bool = False) -&gt; tuple[</span>
+<span class="source-line" id="L564"><a href="#L564"> 564</a>         torch.Tensor,</span>
+<span class="source-line" id="L565"><a href="#L565"> 565</a>         Callable[[torch.Tensor], tuple[torch.Tensor, int, dict[str, torch.Tensor | list[str]]]],</span>
+<span class="source-line" id="L566"><a href="#L566"> 566</a>     ]:</span>
+<span class="source-line" id="L567"><a href="#L567"> 567</a>         &quot;&quot;&quot;Forward step used by Megatron&#x27;s pipeline engine during training.</span>
+<span class="source-line" id="L568"><a href="#L568"> 568</a> </span>
+<span class="source-line" id="L569"><a href="#L569"> 569</a>         Args:</span>
+<span class="source-line" id="L570"><a href="#L570"> 570</a>             data_iterator (DataIterator): Input data iterator.</span>
+<span class="source-line" id="L571"><a href="#L571"> 571</a>             model (GPTModel): The GPT model chunk to execute.</span>
+<span class="source-line" id="L572"><a href="#L572"> 572</a> </span>
+<span class="source-line" id="L573"><a href="#L573"> 573</a>         Returns:</span>
+<span class="source-line" id="L574"><a href="#L574"> 574</a>             tuple[torch.Tensor, Callable[[torch.Tensor], tuple[torch.Tensor, int, dict[str, torch.Tensor | list[str]]]]]:</span>
+<span class="source-line" id="L575"><a href="#L575"> 575</a>             Output tensor(s) and the loss function, which returns</span>
+<span class="source-line" id="L576"><a href="#L576"> 576</a>             (loss, num_elems, {&quot;keys&quot;: list[str], &quot;values&quot;: torch.Tensor}).</span>
+<span class="source-line" id="L577"><a href="#L577"> 577</a>         &quot;&quot;&quot;</span>
+<span class="source-line" id="L578"><a href="#L578"> 578</a> </span>
+<span class="source-line" id="L579"><a href="#L579"> 579</a>         # Get the batch.</span>
+<span class="source-line" id="L580"><a href="#L580"> 580</a>         batch = get_batch(</span>
+<span class="source-line" id="L581"><a href="#L581"> 581</a>             data_iterator,</span>
+<span class="source-line" id="L582"><a href="#L582"> 582</a>             _with_rollout_top_p_token_keys(</span>
+<span class="source-line" id="L583"><a href="#L583"> 583</a>                 args,</span>
+<span class="source-line" id="L584"><a href="#L584"> 584</a>                 [</span>
+<span class="source-line" id="L585"><a href="#L585"> 585</a>                     &quot;tokens&quot;,</span>
+<span class="source-line" id="L586"><a href="#L586"> 586</a>                     &quot;multimodal_train_inputs&quot;,</span>
+<span class="source-line" id="L587"><a href="#L587"> 587</a>                     &quot;packed_seq_params&quot;,</span>
+<span class="source-line" id="L588"><a href="#L588"> 588</a>                     &quot;total_lengths&quot;,</span>
+<span class="source-line" id="L589"><a href="#L589"> 589</a>                     &quot;response_lengths&quot;,</span>
+<span class="source-line" id="L590"><a href="#L590"> 590</a>                     &quot;loss_masks&quot;,</span>
+<span class="source-line" id="L591"><a href="#L591"> 591</a>                     &quot;log_probs&quot;,</span>
+<span class="source-line" id="L592"><a href="#L592"> 592</a>                     &quot;ref_log_probs&quot;,</span>
+<span class="source-line" id="L593"><a href="#L593"> 593</a>                     &quot;values&quot;,</span>
+<span class="source-line" id="L594"><a href="#L594"> 594</a>                     &quot;advantages&quot;,</span>
+<span class="source-line" id="L595"><a href="#L595"> 595</a>                     &quot;returns&quot;,</span>
+<span class="source-line" id="L596"><a href="#L596"> 596</a>                     &quot;rollout_log_probs&quot;,</span>
+<span class="source-line" id="L597"><a href="#L597"> 597</a>                     &quot;teacher_log_probs&quot;,</span>
+<span class="source-line" id="L598"><a href="#L598"> 598</a>                     &quot;rollout_mask_sums&quot;,</span>
+<span class="source-line" id="L599"><a href="#L599"> 599</a>                     # Only present when dumping train debug data; lets the loss</span>
+<span class="source-line" id="L600"><a href="#L600"> 600</a>                     # snapshot each sample&#x27;s log_probs keyed by rollout position.</span>
+<span class="source-line" id="L601"><a href="#L601"> 601</a>                     *([&quot;partition&quot;] if args.save_debug_train_data is not None else []),</span>
+<span class="source-line" id="L602"><a href="#L602"> 602</a>                 ],</span>
+<span class="source-line" id="L603"><a href="#L603"> 603</a>             ),</span>
+<span class="source-line" id="L604"><a href="#L604"> 604</a>             args.data_pad_size_multiplier,</span>
+<span class="source-line" id="L605"><a href="#L605"> 605</a>             args.allgather_cp,</span>
+<span class="source-line" id="L606"><a href="#L606"> 606</a>         )</span>
+<span class="source-line" id="L607"><a href="#L607"> 607</a> </span>
+<span class="source-line" id="L608"><a href="#L608"> 608</a>         if os.environ.get(&quot;ENABLE_ROUTING_REPLAY&quot;, &quot;0&quot;) == &quot;1&quot;:</span>
+<span class="source-line" id="L609"><a href="#L609"> 609</a>             old_stage = os.environ[&quot;ROUTING_REPLAY_STAGE&quot;]</span>
+<span class="source-line" id="L610"><a href="#L610"> 610</a>             os.environ[&quot;ROUTING_REPLAY_STAGE&quot;] = &quot;replay_forward&quot;</span>
+<span class="source-line" id="L611"><a href="#L611"> 611</a> </span>
+<span class="source-line" id="L612"><a href="#L612"> 612</a>         if return_schedule_plan:</span>
+<span class="source-line" id="L613"><a href="#L613"> 613</a>             assert not args.enable_mtp_training, &quot;MTP training should not be enabled when using combined 1f1b&quot;</span>
+<span class="source-line" id="L614"><a href="#L614"> 614</a>             position_ids = None</span>
+<span class="source-line" id="L615"><a href="#L615"> 615</a>             output_tensor = model.build_schedule_plan(</span>
+<span class="source-line" id="L616"><a href="#L616"> 616</a>                 input_ids=batch[&quot;tokens&quot;],</span>
+<span class="source-line" id="L617"><a href="#L617"> 617</a>                 position_ids=position_ids,</span>
+<span class="source-line" id="L618"><a href="#L618"> 618</a>                 attention_mask=None,</span>
+<span class="source-line" id="L619"><a href="#L619"> 619</a>                 labels=None,</span>
+<span class="source-line" id="L620"><a href="#L620"> 620</a>                 packed_seq_params=batch[&quot;packed_seq_params&quot;],</span>
+<span class="source-line" id="L621"><a href="#L621"> 621</a>                 loss_mask=batch[&quot;full_loss_masks&quot;],</span>
+<span class="source-line" id="L622"><a href="#L622"> 622</a>             )</span>
+<span class="source-line" id="L623"><a href="#L623"> 623</a>         else:</span>
+<span class="source-line" id="L624"><a href="#L624"> 624</a>             forward_kwargs = {</span>
+<span class="source-line" id="L625"><a href="#L625"> 625</a>                 &quot;input_ids&quot;: batch[&quot;tokens&quot;],</span>
+<span class="source-line" id="L626"><a href="#L626"> 626</a>                 &quot;position_ids&quot;: None,</span>
+<span class="source-line" id="L627"><a href="#L627"> 627</a>                 &quot;attention_mask&quot;: None,</span>
+<span class="source-line" id="L628"><a href="#L628"> 628</a>                 &quot;labels&quot;: None,</span>
+<span class="source-line" id="L629"><a href="#L629"> 629</a>                 &quot;packed_seq_params&quot;: batch[&quot;packed_seq_params&quot;],</span>
+<span class="source-line" id="L630"><a href="#L630"> 630</a>                 &quot;loss_mask&quot;: batch[&quot;full_loss_masks&quot;],</span>
+<span class="source-line" id="L631"><a href="#L631"> 631</a>             }</span>
+<span class="source-line" id="L632"><a href="#L632"> 632</a> </span>
+<span class="source-line" id="L633"><a href="#L633"> 633</a>             if batch[&quot;multimodal_train_inputs&quot;] is not None:</span>
+<span class="source-line" id="L634"><a href="#L634"> 634</a>                 forward_kwargs.update(batch[&quot;multimodal_train_inputs&quot;])</span>
+<span class="source-line" id="L635"><a href="#L635"> 635</a> </span>
+<span class="source-line" id="L636"><a href="#L636"> 636</a>             if args.enable_mtp_training:</span>
+<span class="source-line" id="L637"><a href="#L637"> 637</a>                 forward_kwargs[&quot;mtp_kwargs&quot;] = {&quot;mtp_labels&quot;: batch[&quot;tokens&quot;]}</span>
+<span class="source-line" id="L638"><a href="#L638"> 638</a> </span>
+<span class="source-line" id="L639"><a href="#L639"> 639</a>             output_tensor = model(**forward_kwargs)</span>
+<span class="source-line" id="L640"><a href="#L640"> 640</a> </span>
+<span class="source-line" id="L641"><a href="#L641"> 641</a>         if os.environ.get(&quot;ENABLE_ROUTING_REPLAY&quot;, &quot;0&quot;) == &quot;1&quot;:</span>
+<span class="source-line" id="L642"><a href="#L642"> 642</a>             os.environ[&quot;ROUTING_REPLAY_STAGE&quot;] = old_stage</span>
+<span class="source-line" id="L643"><a href="#L643"> 643</a> </span>
+<span class="source-line" id="L644"><a href="#L644"> 644</a>         return output_tensor, partial(loss_function, args, batch, num_microbatches, step_global_batch_size)</span>
+<span class="source-line" id="L645"><a href="#L645"> 645</a> </span>
+<span class="source-line" id="L646"><a href="#L646"> 646</a>     # Forward pass.</span>
+<span class="source-line" id="L647"><a href="#L647"> 647</a>     forward_backward_func = get_forward_backward_func()</span>
+<span class="source-line" id="L648"><a href="#L648"> 648</a>     losses_reduced = forward_backward_func(</span>
+<span class="source-line" id="L649"><a href="#L649"> 649</a>         forward_step_func=_wrap_forward_step_with_microbatch_pbar(forward_step, microbatch_pbar),</span>
+<span class="source-line" id="L650"><a href="#L650"> 650</a>         data_iterator=data_iterator,</span>
+<span class="source-line" id="L651"><a href="#L651"> 651</a>         model=model,</span>
+<span class="source-line" id="L652"><a href="#L652"> 652</a>         num_microbatches=num_microbatches,</span>
+<span class="source-line" id="L653"><a href="#L653"> 653</a>         seq_length=args.seq_length,</span>
+<span class="source-line" id="L654"><a href="#L654"> 654</a>         micro_batch_size=args.micro_batch_size,</span>
+<span class="source-line" id="L655"><a href="#L655"> 655</a>         decoder_seq_length=args.decoder_seq_length,</span>
+<span class="source-line" id="L656"><a href="#L656"> 656</a>         forward_only=False,</span>
+<span class="source-line" id="L657"><a href="#L657"> 657</a>     )</span>
+<span class="source-line" id="L658"><a href="#L658"> 658</a> </span>
+<span class="source-line" id="L659"><a href="#L659"> 659</a>     valid_step = True</span>
+<span class="source-line" id="L660"><a href="#L660"> 660</a>     grad_norm = float(&quot;nan&quot;)</span>
+<span class="source-line" id="L661"><a href="#L661"> 661</a>     if not getattr(args, &quot;check_for_nan_in_loss_and_grad&quot;, True):</span>
+<span class="source-line" id="L662"><a href="#L662"> 662</a>         found_inf_flag = optimizer.prepare_grads()</span>
+<span class="source-line" id="L663"><a href="#L663"> 663</a>         if found_inf_flag:</span>
+<span class="source-line" id="L664"><a href="#L664"> 664</a>             valid_step = False</span>
+<span class="source-line" id="L665"><a href="#L665"> 665</a>         else:</span>
+<span class="source-line" id="L666"><a href="#L666"> 666</a>             grad_norm = optimizer.get_grad_norm()</span>
+<span class="source-line" id="L667"><a href="#L667"> 667</a>             if isinstance(grad_norm, torch.Tensor):</span>
+<span class="source-line" id="L668"><a href="#L668"> 668</a>                 valid_step = not (torch.isnan(grad_norm) or torch.isinf(grad_norm))</span>
+<span class="source-line" id="L669"><a href="#L669"> 669</a>             else:</span>
+<span class="source-line" id="L670"><a href="#L670"> 670</a>                 valid_step = not (math.isnan(grad_norm) or math.isinf(grad_norm))</span>
+<span class="source-line" id="L671"><a href="#L671"> 671</a> </span>
+<span class="source-line" id="L672"><a href="#L672"> 672</a>     # CI check: verify only MTP parameters have non-zero gradients when truncation happens</span>
+<span class="source-line" id="L673"><a href="#L673"> 673</a>     # This check must happen before optimizer.step() as gradients may be modified during step</span>
+<span class="source-line" id="L674"><a href="#L674"> 674</a>     if args.ci_test and args.enable_mtp_training:</span>
+<span class="source-line" id="L675"><a href="#L675"> 675</a>         from slime.backends.megatron_utils.ci_utils import check_mtp_only_grad</span>
+<span class="source-line" id="L676"><a href="#L676"> 676</a> </span>
+<span class="source-line" id="L677"><a href="#L677"> 677</a>         check_mtp_only_grad(model, step_id)</span>
+<span class="source-line" id="L678"><a href="#L678"> 678</a> </span>
+<span class="source-line" id="L679"><a href="#L679"> 679</a>     if valid_step:</span>
+<span class="source-line" id="L680"><a href="#L680"> 680</a>         # Update parameters.</span>
+<span class="source-line" id="L681"><a href="#L681"> 681</a>         update_successful, grad_norm, num_zeros_in_grad = optimizer.step()</span>
+<span class="source-line" id="L682"><a href="#L682"> 682</a> </span>
+<span class="source-line" id="L683"><a href="#L683"> 683</a>         # Update learning rate. Use the per-step global_batch_size when dynamic</span>
+<span class="source-line" id="L684"><a href="#L684"> 684</a>         # batching is on so the scheduler&#x27;s samples-seen counter tracks reality.</span>
+<span class="source-line" id="L685"><a href="#L685"> 685</a>         assert update_successful</span>
+<span class="source-line" id="L686"><a href="#L686"> 686</a>         opt_param_scheduler.step(increment=step_global_batch_size)</span>
+<span class="source-line" id="L687"><a href="#L687"> 687</a> </span>
+<span class="source-line" id="L688"><a href="#L688"> 688</a>     # release grad</span>
+<span class="source-line" id="L689"><a href="#L689"> 689</a>     for model_chunk in model:</span>
+<span class="source-line" id="L690"><a href="#L690"> 690</a>         model_chunk.zero_grad_buffer()</span>
+<span class="source-line" id="L691"><a href="#L691"> 691</a>     optimizer.zero_grad()</span>
+<span class="source-line" id="L692"><a href="#L692"> 692</a> </span>
+<span class="source-line" id="L693"><a href="#L693"> 693</a>     if mpu.is_pipeline_last_stage(ignore_virtual=True):</span>
+<span class="source-line" id="L694"><a href="#L694"> 694</a>         loss_reduced = train_metric_utils.reduce_train_step_metrics(</span>
+<span class="source-line" id="L695"><a href="#L695"> 695</a>             losses_reduced,</span>
+<span class="source-line" id="L696"><a href="#L696"> 696</a>             calculate_per_token_loss=args.calculate_per_token_loss,</span>
+<span class="source-line" id="L697"><a href="#L697"> 697</a>             step_global_batch_size=step_global_batch_size,</span>
+<span class="source-line" id="L698"><a href="#L698"> 698</a>             cp_size=mpu.get_context_parallel_world_size(),</span>
+<span class="source-line" id="L699"><a href="#L699"> 699</a>             dp_with_cp_group=mpu.get_data_parallel_group(with_context_parallel=True),</span>
+<span class="source-line" id="L700"><a href="#L700"> 700</a>         )</span>
+<span class="source-line" id="L701"><a href="#L701"> 701</a>         return loss_reduced, grad_norm</span>
+<span class="source-line" id="L702"><a href="#L702"> 702</a>     return {}, grad_norm</span>
+<span class="source-line" id="L703"><a href="#L703"> 703</a> </span>
+<span class="source-line" id="L704"><a href="#L704"> 704</a> </span>
+<span class="source-line" id="L705"><a href="#L705"> 705</a> def should_disable_forward_pre_hook(args: Namespace) -&gt; bool:</span>
+<span class="source-line" id="L706"><a href="#L706"> 706</a>     &quot;&quot;&quot;Block forward pre-hook for certain configurations.&quot;&quot;&quot;</span>
+<span class="source-line" id="L707"><a href="#L707"> 707</a>     return args.use_distributed_optimizer and args.overlap_param_gather</span>
+<span class="source-line" id="L708"><a href="#L708"> 708</a> </span>
+<span class="source-line" id="L709"><a href="#L709"> 709</a> </span>
+<span class="source-line" id="L710"><a href="#L710"> 710</a> def train(</span>
+<span class="source-line" id="L711"><a href="#L711"> 711</a>     rollout_id: int,</span>
+<span class="source-line" id="L712"><a href="#L712"> 712</a>     model: Sequence[DDP],</span>
+<span class="source-line" id="L713"><a href="#L713"> 713</a>     optimizer: MegatronOptimizer,</span>
+<span class="source-line" id="L714"><a href="#L714"> 714</a>     opt_param_scheduler: OptimizerParamScheduler,</span>
+<span class="source-line" id="L715"><a href="#L715"> 715</a>     data_iterator: Sequence[DataIterator],</span>
+<span class="source-line" id="L716"><a href="#L716"> 716</a>     num_microbatches: Sequence[int],</span>
+<span class="source-line" id="L717"><a href="#L717"> 717</a>     global_batch_sizes: Sequence[int],</span>
+<span class="source-line" id="L718"><a href="#L718"> 718</a> ) -&gt; None:</span>
+<span class="source-line" id="L719"><a href="#L719"> 719</a>     &quot;&quot;&quot;Run training over a rollout consisting of multiple steps.</span>
+<span class="source-line" id="L720"><a href="#L720"> 720</a> </span>
+<span class="source-line" id="L721"><a href="#L721"> 721</a>     The model is switched to train mode, training hooks are configured, and</span>
+<span class="source-line" id="L722"><a href="#L722"> 722</a>     ``train_one_step`` is invoked for each step in the rollout.</span>
+<span class="source-line" id="L723"><a href="#L723"> 723</a> </span>
+<span class="source-line" id="L724"><a href="#L724"> 724</a>     Args:</span>
+<span class="source-line" id="L725"><a href="#L725"> 725</a>         rollout_id (int): Rollout identifier.</span>
+<span class="source-line" id="L726"><a href="#L726"> 726</a>         model (Sequence[DDP]): Sequence of DDP-wrapped model chunks.</span>
+<span class="source-line" id="L727"><a href="#L727"> 727</a>         optimizer (MegatronOptimizer): Optimizer instance.</span>
+<span class="source-line" id="L728"><a href="#L728"> 728</a>         opt_param_scheduler (OptimizerParamScheduler): LR/WD scheduler.</span>
+<span class="source-line" id="L729"><a href="#L729"> 729</a>         data_iterator (Sequence[DataIterator]): Iterable(s) yielding training batches.</span>
+<span class="source-line" id="L730"><a href="#L730"> 730</a>         num_microbatches (Sequence[int]): Microbatches per step in the rollout.</span>
+<span class="source-line" id="L731"><a href="#L731"> 731</a>         global_batch_sizes (Sequence[int]): Rollout count per step (total</span>
+<span class="source-line" id="L732"><a href="#L732"> 732</a>             across DP; one &quot;rollout&quot; = one execution of one of the</span>
+<span class="source-line" id="L733"><a href="#L733"> 733</a>             ``n_samples_per_prompt`` rollouts of a prompt). Same length as</span>
+<span class="source-line" id="L734"><a href="#L734"> 734</a>             ``num_microbatches``; consumed by ``train_one_step`` for loss</span>
+<span class="source-line" id="L735"><a href="#L735"> 735</a>             scaling and LR scheduler increments. Equals per-step sample count</span>
+<span class="source-line" id="L736"><a href="#L736"> 736</a>             in the common case (1 rollout = 1 sample).</span>
+<span class="source-line" id="L737"><a href="#L737"> 737</a>     &quot;&quot;&quot;</span>
+<span class="source-line" id="L738"><a href="#L738"> 738</a>     args = get_args()</span>
+<span class="source-line" id="L739"><a href="#L739"> 739</a> </span>
+<span class="source-line" id="L740"><a href="#L740"> 740</a>     assert len(num_microbatches) == len(global_batch_sizes), (</span>
+<span class="source-line" id="L741"><a href="#L741"> 741</a>         f&quot;num_microbatches and global_batch_sizes must have the same length, &quot;</span>
+<span class="source-line" id="L742"><a href="#L742"> 742</a>         f&quot;got {len(num_microbatches)} vs {len(global_batch_sizes)}&quot;</span>
+<span class="source-line" id="L743"><a href="#L743"> 743</a>     )</span>
+<span class="source-line" id="L744"><a href="#L744"> 744</a> </span>
+<span class="source-line" id="L745"><a href="#L745"> 745</a>     for iterator in data_iterator:</span>
+<span class="source-line" id="L746"><a href="#L746"> 746</a>         iterator.reset()</span>
+<span class="source-line" id="L747"><a href="#L747"> 747</a> </span>
+<span class="source-line" id="L748"><a href="#L748"> 748</a>     # Turn on training mode which enables dropout.</span>
+<span class="source-line" id="L749"><a href="#L749"> 749</a>     for model_module in model:</span>
+<span class="source-line" id="L750"><a href="#L750"> 750</a>         model_module.train()</span>
+<span class="source-line" id="L751"><a href="#L751"> 751</a> </span>
+<span class="source-line" id="L752"><a href="#L752"> 752</a>     # Setup some training config params.</span>
+<span class="source-line" id="L753"><a href="#L753"> 753</a>     config = get_model_config(model[0])</span>
+<span class="source-line" id="L754"><a href="#L754"> 754</a>     config.grad_scale_func = optimizer.scale_loss</span>
+<span class="source-line" id="L755"><a href="#L755"> 755</a>     config.timers = None</span>
+<span class="source-line" id="L756"><a href="#L756"> 756</a>     if isinstance(model[0], DDP) and args.overlap_grad_reduce:</span>
+<span class="source-line" id="L757"><a href="#L757"> 757</a>         assert config.no_sync_func is None, (</span>
+<span class="source-line" id="L758"><a href="#L758"> 758</a>             &quot;When overlap_grad_reduce is True, config.no_sync_func must be None; &quot;</span>
+<span class="source-line" id="L759"><a href="#L759"> 759</a>             &quot;a custom no_sync_func is not supported when overlapping grad-reduce&quot;</span>
+<span class="source-line" id="L760"><a href="#L760"> 760</a>         )</span>
+<span class="source-line" id="L761"><a href="#L761"> 761</a>         config.no_sync_func = [model_chunk.no_sync for model_chunk in model]</span>
+<span class="source-line" id="L762"><a href="#L762"> 762</a>         if len(model) == 1:</span>
+<span class="source-line" id="L763"><a href="#L763"> 763</a>             config.no_sync_func = config.no_sync_func[0]</span>
+<span class="source-line" id="L764"><a href="#L764"> 764</a>         if args.align_grad_reduce:</span>
+<span class="source-line" id="L765"><a href="#L765"> 765</a>             config.grad_sync_func = [model_chunk.start_grad_sync for model_chunk in model]</span>
+<span class="source-line" id="L766"><a href="#L766"> 766</a>             if len(model) == 1:</span>
+<span class="source-line" id="L767"><a href="#L767"> 767</a>                 config.grad_sync_func = config.grad_sync_func[0]</span>
+<span class="source-line" id="L768"><a href="#L768"> 768</a>     if args.overlap_param_gather and args.align_param_gather:</span>
+<span class="source-line" id="L769"><a href="#L769"> 769</a>         config.param_sync_func = [model_chunk.start_param_sync for model_chunk in model]</span>
+<span class="source-line" id="L770"><a href="#L770"> 770</a>         if len(model) == 1:</span>
+<span class="source-line" id="L771"><a href="#L771"> 771</a>             config.param_sync_func = config.param_sync_func[0]</span>
+<span class="source-line" id="L772"><a href="#L772"> 772</a>     config.finalize_model_grads_func = finalize_model_grads</span>
+<span class="source-line" id="L773"><a href="#L773"> 773</a> </span>
+<span class="source-line" id="L774"><a href="#L774"> 774</a>     pre_hook_enabled = False</span>
+<span class="source-line" id="L775"><a href="#L775"> 775</a> </span>
+<span class="source-line" id="L776"><a href="#L776"> 776</a>     if args.reset_optimizer_states:</span>
+<span class="source-line" id="L777"><a href="#L777"> 777</a>         if (</span>
+<span class="source-line" id="L778"><a href="#L778"> 778</a>             mpu.get_data_parallel_rank(with_context_parallel=True) == 0</span>
+<span class="source-line" id="L779"><a href="#L779"> 779</a>             and mpu.get_tensor_model_parallel_rank() == 0</span>
+<span class="source-line" id="L780"><a href="#L780"> 780</a>             and mpu.get_pipeline_model_parallel_rank() == mpu.get_pipeline_model_parallel_world_size() - 1</span>
+<span class="source-line" id="L781"><a href="#L781"> 781</a>         ):</span>
+<span class="source-line" id="L782"><a href="#L782"> 782</a>             logger.info(&quot;Reset optimizer states&quot;)</span>
+<span class="source-line" id="L783"><a href="#L783"> 783</a>         for chained_optimizer in optimizer.chained_optimizers:</span>
+<span class="source-line" id="L784"><a href="#L784"> 784</a>             for group in chained_optimizer.optimizer.param_groups:</span>
+<span class="source-line" id="L785"><a href="#L785"> 785</a>                 if &quot;step&quot; in group:</span>
+<span class="source-line" id="L786"><a href="#L786"> 786</a>                     group[&quot;step&quot;] = 0</span>
+<span class="source-line" id="L787"><a href="#L787"> 787</a>             for state in chained_optimizer.optimizer.state.values():</span>
+<span class="source-line" id="L788"><a href="#L788"> 788</a>                 if &quot;step&quot; in state:</span>
+<span class="source-line" id="L789"><a href="#L789"> 789</a>                     if isinstance(state[&quot;step&quot;], torch.Tensor):</span>
+<span class="source-line" id="L790"><a href="#L790"> 790</a>                         state[&quot;step&quot;].zero_()</span>
+<span class="source-line" id="L791"><a href="#L791"> 791</a>                     else:</span>
+<span class="source-line" id="L792"><a href="#L792"> 792</a>                         state[&quot;step&quot;] = 0</span>
+<span class="source-line" id="L793"><a href="#L793"> 793</a>                 if &quot;exp_avg&quot; in state:</span>
+<span class="source-line" id="L794"><a href="#L794"> 794</a>                     state[&quot;exp_avg&quot;].zero_()</span>
+<span class="source-line" id="L795"><a href="#L795"> 795</a>                 if &quot;exp_avg_sq&quot; in state:</span>
+<span class="source-line" id="L796"><a href="#L796"> 796</a>                     state[&quot;exp_avg_sq&quot;].zero_()</span>
+<span class="source-line" id="L797"><a href="#L797"> 797</a> </span>
+<span class="source-line" id="L798"><a href="#L798"> 798</a>     if args.manual_gc:</span>
+<span class="source-line" id="L799"><a href="#L799"> 799</a>         # Disable the default garbage collector and perform the collection manually.</span>
+<span class="source-line" id="L800"><a href="#L800"> 800</a>         # This is to align the timing of garbage collection across ranks.</span>
+<span class="source-line" id="L801"><a href="#L801"> 801</a>         assert args.manual_gc_interval &gt;= 0, &quot;Manual garbage collection interval should be larger than or equal to 0&quot;</span>
+<span class="source-line" id="L802"><a href="#L802"> 802</a>         gc.disable()</span>
+<span class="source-line" id="L803"><a href="#L803"> 803</a>         gc.collect()</span>
+<span class="source-line" id="L804"><a href="#L804"> 804</a> </span>
+<span class="source-line" id="L805"><a href="#L805"> 805</a>     # Disable forward pre-hook to start training to ensure that errors in checkpoint loading</span>
+<span class="source-line" id="L806"><a href="#L806"> 806</a>     # or random initialization don&#x27;t propagate to all ranks in first all-gather (which is a</span>
+<span class="source-line" id="L807"><a href="#L807"> 807</a>     # no-op if things work correctly).</span>
+<span class="source-line" id="L808"><a href="#L808"> 808</a>     if should_disable_forward_pre_hook(args):</span>
+<span class="source-line" id="L809"><a href="#L809"> 809</a>         disable_forward_pre_hook(model, param_sync=False)</span>
+<span class="source-line" id="L810"><a href="#L810"> 810</a>         # Also remove param_sync_func temporarily so that sync calls made in</span>
+<span class="source-line" id="L811"><a href="#L811"> 811</a>         # `forward_backward_func` are no-ops.</span>
+<span class="source-line" id="L812"><a href="#L812"> 812</a>         param_sync_func = config.param_sync_func</span>
+<span class="source-line" id="L813"><a href="#L813"> 813</a>         config.param_sync_func = None</span>
+<span class="source-line" id="L814"><a href="#L814"> 814</a>         pre_hook_enabled = False</span>
+<span class="source-line" id="L815"><a href="#L815"> 815</a> </span>
+<span class="source-line" id="L816"><a href="#L816"> 816</a>     num_steps_per_rollout = len(num_microbatches)</span>
+<span class="source-line" id="L817"><a href="#L817"> 817</a>     microbatch_pbar = tqdm(</span>
+<span class="source-line" id="L818"><a href="#L818"> 818</a>         total=sum(num_microbatches),</span>
+<span class="source-line" id="L819"><a href="#L819"> 819</a>         desc=f&quot;{getattr(model[0], &#x27;role&#x27;, &#x27;actor&#x27;)} train&quot;,</span>
+<span class="source-line" id="L820"><a href="#L820"> 820</a>         unit=&quot;microbatch&quot;,</span>
+<span class="source-line" id="L821"><a href="#L821"> 821</a>         dynamic_ncols=True,</span>
+<span class="source-line" id="L822"><a href="#L822"> 822</a>         leave=False,</span>
+<span class="source-line" id="L823"><a href="#L823"> 823</a>         disable=_disable_tqdm_for_non_main_rank(),</span>
+<span class="source-line" id="L824"><a href="#L824"> 824</a>     )</span>
+<span class="source-line" id="L825"><a href="#L825"> 825</a> </span>
+<span class="source-line" id="L826"><a href="#L826"> 826</a>     # Run training iterations till done.</span>
+<span class="source-line" id="L827"><a href="#L827"> 827</a>     for step_id in range(num_steps_per_rollout):</span>
+<span class="source-line" id="L828"><a href="#L828"> 828</a> </span>
+<span class="source-line" id="L829"><a href="#L829"> 829</a>         # Run training step.</span>
+<span class="source-line" id="L830"><a href="#L830"> 830</a>         loss_dict, grad_norm = train_one_step(</span>
+<span class="source-line" id="L831"><a href="#L831"> 831</a>             args,</span>
+<span class="source-line" id="L832"><a href="#L832"> 832</a>             rollout_id,</span>
+<span class="source-line" id="L833"><a href="#L833"> 833</a>             step_id,</span>
+<span class="source-line" id="L834"><a href="#L834"> 834</a>             data_iterator,</span>
+<span class="source-line" id="L835"><a href="#L835"> 835</a>             model,</span>
+<span class="source-line" id="L836"><a href="#L836"> 836</a>             optimizer,</span>
+<span class="source-line" id="L837"><a href="#L837"> 837</a>             opt_param_scheduler,</span>
+<span class="source-line" id="L838"><a href="#L838"> 838</a>             num_microbatches[step_id],</span>
+<span class="source-line" id="L839"><a href="#L839"> 839</a>             global_batch_sizes[step_id],</span>
+<span class="source-line" id="L840"><a href="#L840"> 840</a>             microbatch_pbar=microbatch_pbar,</span>
+<span class="source-line" id="L841"><a href="#L841"> 841</a>         )</span>
+<span class="source-line" id="L842"><a href="#L842"> 842</a> </span>
+<span class="source-line" id="L843"><a href="#L843"> 843</a>         if step_id == 0:</span>
+<span class="source-line" id="L844"><a href="#L844"> 844</a>             # Enable forward pre-hook after training step has successfully run. All subsequent</span>
+<span class="source-line" id="L845"><a href="#L845"> 845</a>             # forward passes will use the forward pre-hook / `param_sync_func` in</span>
+<span class="source-line" id="L846"><a href="#L846"> 846</a>             # `forward_backward_func`.</span>
+<span class="source-line" id="L847"><a href="#L847"> 847</a>             if should_disable_forward_pre_hook(args):</span>
+<span class="source-line" id="L848"><a href="#L848"> 848</a>                 enable_forward_pre_hook(model)</span>
+<span class="source-line" id="L849"><a href="#L849"> 849</a>                 config.param_sync_func = param_sync_func</span>
+<span class="source-line" id="L850"><a href="#L850"> 850</a>                 pre_hook_enabled = True</span>
+<span class="source-line" id="L851"><a href="#L851"> 851</a> </span>
+<span class="source-line" id="L852"><a href="#L852"> 852</a>         if args.enable_mtp_training:</span>
+<span class="source-line" id="L853"><a href="#L853"> 853</a>             from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper</span>
+<span class="source-line" id="L854"><a href="#L854"> 854</a> </span>
+<span class="source-line" id="L855"><a href="#L855"> 855</a>             mtp_loss_scale = 1 / num_microbatches[step_id]</span>
+<span class="source-line" id="L856"><a href="#L856"> 856</a>             tracker = MTPLossLoggingHelper.tracker</span>
+<span class="source-line" id="L857"><a href="#L857"> 857</a>             if &quot;values&quot; in tracker:</span>
+<span class="source-line" id="L858"><a href="#L858"> 858</a>                 values = tracker[&quot;values&quot;]</span>
+<span class="source-line" id="L859"><a href="#L859"> 859</a>                 if tracker.get(&quot;reduce_group&quot;) is not None:</span>
+<span class="source-line" id="L860"><a href="#L860"> 860</a>                     torch.distributed.all_reduce(values, group=tracker.get(&quot;reduce_group&quot;))</span>
+<span class="source-line" id="L861"><a href="#L861"> 861</a>                 if tracker.get(&quot;avg_group&quot;) is not None:</span>
+<span class="source-line" id="L862"><a href="#L862"> 862</a>                     torch.distributed.all_reduce(values, group=tracker[&quot;avg_group&quot;], op=torch.distributed.ReduceOp.AVG)</span>
+<span class="source-line" id="L863"><a href="#L863"> 863</a>                 # Multi-head MTP: tracker[&quot;values&quot;] is [num_mtp_layers]; aggregate below.</span>
+<span class="source-line" id="L864"><a href="#L864"> 864</a>                 mtp_losses = tracker[&quot;values&quot;] * mtp_loss_scale</span>
+<span class="source-line" id="L865"><a href="#L865"> 865</a>                 MTPLossLoggingHelper.clean_loss_in_tracker()</span>
+<span class="source-line" id="L866"><a href="#L866"> 866</a> </span>
+<span class="source-line" id="L867"><a href="#L867"> 867</a>                 # CI check: verify MTP loss is within expected bounds</span>
+<span class="source-line" id="L868"><a href="#L868"> 868</a>                 if args.ci_test:</span>
+<span class="source-line" id="L869"><a href="#L869"> 869</a>                     from slime.backends.megatron_utils.ci_utils import check_mtp_loss</span>
+<span class="source-line" id="L870"><a href="#L870"> 870</a> </span>
+<span class="source-line" id="L871"><a href="#L871"> 871</a>                     check_mtp_loss(mtp_losses.sum().item())</span>
+<span class="source-line" id="L872"><a href="#L872"> 872</a> </span>
+<span class="source-line" id="L873"><a href="#L873"> 873</a>         # per train step log.</span>
+<span class="source-line" id="L874"><a href="#L874"> 874</a>         if (</span>
+<span class="source-line" id="L875"><a href="#L875"> 875</a>             mpu.get_data_parallel_rank(with_context_parallel=True) == 0</span>
+<span class="source-line" id="L876"><a href="#L876"> 876</a>             and mpu.get_tensor_model_parallel_rank() == 0</span>
+<span class="source-line" id="L877"><a href="#L877"> 877</a>             and mpu.get_pipeline_model_parallel_rank() == mpu.get_pipeline_model_parallel_world_size() - 1</span>
+<span class="source-line" id="L878"><a href="#L878"> 878</a>         ):</span>
+<span class="source-line" id="L879"><a href="#L879"> 879</a>             accumulated_step_id = rollout_id * num_steps_per_rollout + step_id</span>
+<span class="source-line" id="L880"><a href="#L880"> 880</a>             role = getattr(model[0], &quot;role&quot;, &quot;actor&quot;)</span>
+<span class="source-line" id="L881"><a href="#L881"> 881</a>             role_tag = &quot;&quot; if role == &quot;actor&quot; else f&quot;{role}-&quot;</span>
+<span class="source-line" id="L882"><a href="#L882"> 882</a>             log_dict = {</span>
+<span class="source-line" id="L883"><a href="#L883"> 883</a>                 f&quot;train/{role_tag}{key}&quot;: val.mean().item() if isinstance(val, torch.Tensor) else val</span>
+<span class="source-line" id="L884"><a href="#L884"> 884</a>                 for key, val in loss_dict.items()</span>
+<span class="source-line" id="L885"><a href="#L885"> 885</a>             }</span>
+<span class="source-line" id="L886"><a href="#L886"> 886</a>             log_dict[f&quot;train/{role_tag}grad_norm&quot;] = grad_norm</span>
+<span class="source-line" id="L887"><a href="#L887"> 887</a>             if args.enable_mtp_training:</span>
+<span class="source-line" id="L888"><a href="#L888"> 888</a>                 for _i in range(mtp_losses.shape[0]):</span>
+<span class="source-line" id="L889"><a href="#L889"> 889</a>                     log_dict[f&quot;train/{role_tag}mtp_{_i + 1}_loss&quot;] = mtp_losses[_i].item()</span>
+<span class="source-line" id="L890"><a href="#L890"> 890</a>                 log_dict[f&quot;train/{role_tag}mtp_loss&quot;] = mtp_losses.sum().item()</span>
+<span class="source-line" id="L891"><a href="#L891"> 891</a> </span>
+<span class="source-line" id="L892"><a href="#L892"> 892</a>             for param_group_id, param_group in enumerate(optimizer.param_groups):</span>
+<span class="source-line" id="L893"><a href="#L893"> 893</a>                 log_dict[f&quot;train/{role_tag}lr-pg_{param_group_id}&quot;] = opt_param_scheduler.get_lr(param_group)</span>
+<span class="source-line" id="L894"><a href="#L894"> 894</a> </span>
+<span class="source-line" id="L895"><a href="#L895"> 895</a>             # Per-step gbs — uneven step sizes are easy to miss without this.</span>
+<span class="source-line" id="L896"><a href="#L896"> 896</a>             log_dict[f&quot;train/{role_tag}global_batch_size&quot;] = global_batch_sizes[step_id]</span>
+<span class="source-line" id="L897"><a href="#L897"> 897</a>             log_dict[&quot;train/step&quot;] = accumulated_step_id</span>
+<span class="source-line" id="L898"><a href="#L898"> 898</a>             logging_utils.log(args, log_dict, step_key=&quot;train/step&quot;)</span>
+<span class="source-line" id="L899"><a href="#L899"> 899</a> </span>
+<span class="source-line" id="L900"><a href="#L900"> 900</a>             if args.ci_test and &quot;train/train_rollout_logprob_abs_diff&quot; in log_dict:</span>
+<span class="source-line" id="L901"><a href="#L901"> 901</a>                 threshold = args.ci_train_rollout_logprob_abs_diff_threshold</span>
+<span class="source-line" id="L902"><a href="#L902"> 902</a>                 assert log_dict[&quot;train/train_rollout_logprob_abs_diff&quot;] &lt;= threshold, f&quot;{threshold=} {log_dict=}&quot;</span>
+<span class="source-line" id="L903"><a href="#L903"> 903</a> </span>
+<span class="source-line" id="L904"><a href="#L904"> 904</a>             if args.ci_test and not args.ci_disable_kl_checker:</span>
+<span class="source-line" id="L905"><a href="#L905"> 905</a>                 if step_id == 0 and &quot;train/ppo_kl&quot; in log_dict and &quot;train/pg_clipfrac&quot; in log_dict:</span>
+<span class="source-line" id="L906"><a href="#L906"> 906</a>                     # TODO: figure out why KL is not exactly zero when using PPO loss with KL clipping, and whether this is expected behavior or a bug.</span>
+<span class="source-line" id="L907"><a href="#L907"> 907</a>                     assert log_dict[&quot;train/ppo_kl&quot;] &lt; 1e-8, f&quot;{log_dict=}&quot;</span>
+<span class="source-line" id="L908"><a href="#L908"> 908</a>                 # R3 replays rollout routing for the actor path, while ref</span>
+<span class="source-line" id="L909"><a href="#L909"> 909</a>                 # log-probs are computed with normal routing. The initial</span>
+<span class="source-line" id="L910"><a href="#L910"> 910</a>                 # actor/ref KL is therefore not expected to be exactly zero.</span>
+<span class="source-line" id="L911"><a href="#L911"> 911</a>                 if (</span>
+<span class="source-line" id="L912"><a href="#L912"> 912</a>                     accumulated_step_id == 0</span>
+<span class="source-line" id="L913"><a href="#L913"> 913</a>                     and not getattr(args, &quot;use_rollout_routing_replay&quot;, False)</span>
+<span class="source-line" id="L914"><a href="#L914"> 914</a>                     and &quot;train/kl_loss&quot; in log_dict</span>
+<span class="source-line" id="L915"><a href="#L915"> 915</a>                 ):</span>
+<span class="source-line" id="L916"><a href="#L916"> 916</a>                     assert log_dict[&quot;train/kl_loss&quot;] &lt; 1e-8, f&quot;{log_dict=}&quot;</span>
+<span class="source-line" id="L917"><a href="#L917"> 917</a> </span>
+<span class="source-line" id="L918"><a href="#L918"> 918</a>             logger.info(f&quot;{role_tag}step {accumulated_step_id}: {log_dict}&quot;)</span>
+<span class="source-line" id="L919"><a href="#L919"> 919</a> </span>
+<span class="source-line" id="L920"><a href="#L920"> 920</a>             if args.ci_save_grad_norm is not None:</span>
+<span class="source-line" id="L921"><a href="#L921"> 921</a>                 ci_save_grad_norm_path = args.ci_save_grad_norm.format(</span>
+<span class="source-line" id="L922"><a href="#L922"> 922</a>                     role=role,</span>
+<span class="source-line" id="L923"><a href="#L923"> 923</a>                     rollout_id=rollout_id,</span>
+<span class="source-line" id="L924"><a href="#L924"> 924</a>                     step_id=step_id,</span>
+<span class="source-line" id="L925"><a href="#L925"> 925</a>                 )</span>
+<span class="source-line" id="L926"><a href="#L926"> 926</a>                 torch.save(grad_norm, ci_save_grad_norm_path)</span>
+<span class="source-line" id="L927"><a href="#L927"> 927</a>             elif args.ci_load_grad_norm is not None:</span>
+<span class="source-line" id="L928"><a href="#L928"> 928</a>                 ci_load_grad_norm_path = args.ci_load_grad_norm.format(</span>
+<span class="source-line" id="L929"><a href="#L929"> 929</a>                     role=role,</span>
+<span class="source-line" id="L930"><a href="#L930"> 930</a>                     rollout_id=rollout_id,</span>
+<span class="source-line" id="L931"><a href="#L931"> 931</a>                     step_id=step_id,</span>
+<span class="source-line" id="L932"><a href="#L932"> 932</a>                 )</span>
+<span class="source-line" id="L933"><a href="#L933"> 933</a>                 expected_grad_norm = torch.load(ci_load_grad_norm_path)</span>
+<span class="source-line" id="L934"><a href="#L934"> 934</a>                 assert math.isclose(</span>
+<span class="source-line" id="L935"><a href="#L935"> 935</a>                     grad_norm,</span>
+<span class="source-line" id="L936"><a href="#L936"> 936</a>                     expected_grad_norm,</span>
+<span class="source-line" id="L937"><a href="#L937"> 937</a>                     rel_tol=0.01,</span>
+<span class="source-line" id="L938"><a href="#L938"> 938</a>                     abs_tol=0.01,</span>
+<span class="source-line" id="L939"><a href="#L939"> 939</a>                 ), f&quot;grad norm mismatch: {grad_norm} != {expected_grad_norm}&quot;</span>
+<span class="source-line" id="L940"><a href="#L940"> 940</a>     microbatch_pbar.close()</span>
+<span class="source-line" id="L941"><a href="#L941"> 941</a>     # Close out pre-hooks if using distributed optimizer and overlapped param gather.</span>
+<span class="source-line" id="L942"><a href="#L942"> 942</a>     if pre_hook_enabled:</span>
+<span class="source-line" id="L943"><a href="#L943"> 943</a>         disable_forward_pre_hook(model)</span>
+<span class="source-line" id="L944"><a href="#L944"> 944</a> </span>
+<span class="source-line" id="L945"><a href="#L945"> 945</a> </span>
+<span class="source-line" id="L946"><a href="#L946"> 946</a> def save(</span>
+<span class="source-line" id="L947"><a href="#L947"> 947</a>     iteration: int,</span>
+<span class="source-line" id="L948"><a href="#L948"> 948</a>     model: Sequence[DDP],</span>
+<span class="source-line" id="L949"><a href="#L949"> 949</a>     optimizer: MegatronOptimizer,</span>
+<span class="source-line" id="L950"><a href="#L950"> 950</a>     opt_param_scheduler: OptimizerParamScheduler,</span>
+<span class="source-line" id="L951"><a href="#L951"> 951</a> ) -&gt; None:</span>
+<span class="source-line" id="L952"><a href="#L952"> 952</a>     &quot;&quot;&quot;Persist a training checkpoint safely with forward hooks disabled.</span>
+<span class="source-line" id="L953"><a href="#L953"> 953</a> </span>
+<span class="source-line" id="L954"><a href="#L954"> 954</a>     Args:</span>
+<span class="source-line" id="L955"><a href="#L955"> 955</a>         iteration (int): Current global iteration number.</span>
+<span class="source-line" id="L956"><a href="#L956"> 956</a>         model (Sequence[DDP]): Sequence of DDP-wrapped model chunks.</span>
+<span class="source-line" id="L957"><a href="#L957"> 957</a>         optimizer (MegatronOptimizer): Optimizer instance.</span>
+<span class="source-line" id="L958"><a href="#L958"> 958</a>         opt_param_scheduler (OptimizerParamScheduler): LR/WD scheduler.</span>
+<span class="source-line" id="L959"><a href="#L959"> 959</a>     &quot;&quot;&quot;</span>
+<span class="source-line" id="L960"><a href="#L960"> 960</a>     args = get_args()</span>
+<span class="source-line" id="L961"><a href="#L961"> 961</a>     if should_disable_forward_pre_hook(args):</span>
+<span class="source-line" id="L962"><a href="#L962"> 962</a>         disable_forward_pre_hook(model)</span>
+<span class="source-line" id="L963"><a href="#L963"> 963</a>     save_checkpoint(</span>
+<span class="source-line" id="L964"><a href="#L964"> 964</a>         iteration,</span>
+<span class="source-line" id="L965"><a href="#L965"> 965</a>         model,</span>
+<span class="source-line" id="L966"><a href="#L966"> 966</a>         optimizer,</span>
+<span class="source-line" id="L967"><a href="#L967"> 967</a>         opt_param_scheduler,</span>
+<span class="source-line" id="L968"><a href="#L968"> 968</a>         num_floating_point_operations_so_far=0,</span>
+<span class="source-line" id="L969"><a href="#L969"> 969</a>         checkpointing_context=None,</span>
+<span class="source-line" id="L970"><a href="#L970"> 970</a>         train_data_iterator=None,</span>
+<span class="source-line" id="L971"><a href="#L971"> 971</a>         preprocess_common_state_dict_fn=None,</span>
+<span class="source-line" id="L972"><a href="#L972"> 972</a>     )</span>
+<span class="source-line" id="L973"><a href="#L973"> 973</a>     if should_disable_forward_pre_hook(args):</span>
+<span class="source-line" id="L974"><a href="#L974"> 974</a>         enable_forward_pre_hook(model)</span>
+<span class="source-line" id="L975"><a href="#L975"> 975</a> </span>
+<span class="source-line" id="L976"><a href="#L976"> 976</a> </span>
+<span class="source-line" id="L977"><a href="#L977"> 977</a> def initialize_model_and_optimizer(</span>
+<span class="source-line" id="L978"><a href="#L978"> 978</a>     args: Namespace, role: str = &quot;actor&quot;</span>
+<span class="source-line" id="L979"><a href="#L979"> 979</a> ) -&gt; tuple[list[DDP], MegatronOptimizer | None, OptimizerParamScheduler | None, int]:</span>
+<span class="source-line" id="L980"><a href="#L980"> 980</a>     &quot;&quot;&quot;Initialize model(s), optimizer, scheduler, and load from checkpoint.</span>
+<span class="source-line" id="L981"><a href="#L981"> 981</a> </span>
+<span class="source-line" id="L982"><a href="#L982"> 982</a>     Args:</span>
+<span class="source-line" id="L983"><a href="#L983"> 983</a>         args (Namespace): Runtime arguments.</span>
+<span class="source-line" id="L984"><a href="#L984"> 984</a>         role (str): Logical role of the model (e.g., &quot;actor&quot;, &quot;critic&quot;).</span>
+<span class="source-line" id="L985"><a href="#L985"> 985</a> </span>
+<span class="source-line" id="L986"><a href="#L986"> 986</a>     Returns:</span>
+<span class="source-line" id="L987"><a href="#L987"> 987</a>         tuple[list[DDP], MegatronOptimizer | None, OptimizerParamScheduler | None, int]:</span>
+<span class="source-line" id="L988"><a href="#L988"> 988</a>             DDP-wrapped model chunks, optimizer, scheduler, and iteration index.</span>
+<span class="source-line" id="L989"><a href="#L989"> 989</a>     &quot;&quot;&quot;</span>
+<span class="source-line" id="L990"><a href="#L990"> 990</a> </span>
+<span class="source-line" id="L991"><a href="#L991"> 991</a>     if torch.version.hip:</span>
+<span class="source-line" id="L992"><a href="#L992"> 992</a>         import megatron.core.dist_checkpointing.strategies.filesystem_async as filesystem_async_module</span>
+<span class="source-line" id="L993"><a href="#L993"> 993</a> </span>
+<span class="source-line" id="L994"><a href="#L994"> 994</a>         from slime.utils.rocm_checkpoint_writer import ROCmFileSystemWriterAsync</span>
+<span class="source-line" id="L995"><a href="#L995"> 995</a> </span>
+<span class="source-line" id="L996"><a href="#L996"> 996</a>         filesystem_async_module.FileSystemWriterAsync = ROCmFileSystemWriterAsync</span>
+<span class="source-line" id="L997"><a href="#L997"> 997</a>         print(&quot;[ROCm] Applied FileSystemWriterAsync patch for HIP compatibility&quot;)</span>
+<span class="source-line" id="L998"><a href="#L998"> 998</a> </span>
+<span class="source-line" id="L999"><a href="#L999"> 999</a>     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(args, role)</span>
+<span class="source-line" id="L1000"><a href="#L1000">1000</a>     model[0].role = role</span>
+<span class="source-line" id="L1001"><a href="#L1001">1001</a>     reinit_critic_output_layer = _critic_output_layer_needs_reinit(args, model, role)</span>
+<span class="source-line" id="L1002"><a href="#L1002">1002</a>     clear_memory()</span>
+<span class="source-line" id="L1003"><a href="#L1003">1003</a>     iteration, _ = load_checkpoint(</span>
+<span class="source-line" id="L1004"><a href="#L1004">1004</a>         model,</span>
+<span class="source-line" id="L1005"><a href="#L1005">1005</a>         optimizer,</span>
+<span class="source-line" id="L1006"><a href="#L1006">1006</a>         opt_param_scheduler,</span>
+<span class="source-line" id="L1007"><a href="#L1007">1007</a>         checkpointing_context={},</span>
+<span class="source-line" id="L1008"><a href="#L1008">1008</a>     )</span>
+<span class="source-line" id="L1009"><a href="#L1009">1009</a>     if reinit_critic_output_layer:</span>
+<span class="source-line" id="L1010"><a href="#L1010">1010</a>         _reinitialize_critic_output_layer(args, model)</span>
+<span class="source-line" id="L1011"><a href="#L1011">1011</a>         if (args.fp16 or args.bf16) and optimizer is not None:</span>
+<span class="source-line" id="L1012"><a href="#L1012">1012</a>             optimizer.reload_model_params()</span>
+<span class="source-line" id="L1013"><a href="#L1013">1013</a>     clear_memory()</span>
+<span class="source-line" id="L1014"><a href="#L1014">1014</a> </span>
+<span class="source-line" id="L1015"><a href="#L1015">1015</a>     return model, optimizer, opt_param_scheduler, iteration</span></code></pre></main></body></html>

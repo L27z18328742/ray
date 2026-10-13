@@ -1,0 +1,2 @@
+2026-09-20 17:28:50,464	INFO worker.py:1951 -- Started a local Ray instance.
+PASS backpressure: results=12, peak_pending=3, limit=3

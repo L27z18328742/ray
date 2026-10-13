@@ -1,0 +1,2 @@
+2026-09-20 17:28:41,119	INFO worker.py:1951 -- Started a local Ray instance.
+PASS objects: top-level=21; boxed shards= [[0, 2], [1, 3]]

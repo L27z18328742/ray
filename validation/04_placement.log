@@ -1,0 +1,2 @@
+2026-09-20 17:28:43,833	INFO worker.py:1951 -- Started a local Ray instance.
+PASS placement: 2 CPU bundles ready; 3 CPU bundle pending (expected)

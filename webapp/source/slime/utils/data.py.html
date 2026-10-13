@@ -1,0 +1,347 @@
+<!doctype html><html lang="zh-Hans"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="description" content="从 Ray 入门到读懂 slime/ray：基于固定源码的中文交互教程。">
+<title>slime/utils/data.py · Ray 与 slime 源码导读</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="../../../assets/style.css">
+<link rel="stylesheet" href="../../../assets/tutorial.css"></head><body class="source-page"><header class="topbar">
+<a class="brand" href="../../../index.html">Ray 与 slime</a><a href="https://github.com/THUDM/slime/blob/5bae5bb7928d65906e24e99f5b5d3f99a4daaf93/slime/utils/data.py">GitHub 固定版本 ↗</a></header>
+<main class="source-wrap"><p><a href="../../../chapters/sources.html">← 源码索引</a> · 5bae5bb7928d · 只读快照</p>
+<h1>slime/utils/data.py</h1><pre class="source-code"><code><span class="source-line" id="L1"><a href="#L1">   1</a> import itertools</span>
+<span class="source-line" id="L2"><a href="#L2">   2</a> import json</span>
+<span class="source-line" id="L3"><a href="#L3">   3</a> import logging</span>
+<span class="source-line" id="L4"><a href="#L4">   4</a> import os</span>
+<span class="source-line" id="L5"><a href="#L5">   5</a> import random</span>
+<span class="source-line" id="L6"><a href="#L6">   6</a> import re</span>
+<span class="source-line" id="L7"><a href="#L7">   7</a> </span>
+<span class="source-line" id="L8"><a href="#L8">   8</a> import numpy as np</span>
+<span class="source-line" id="L9"><a href="#L9">   9</a> import ray</span>
+<span class="source-line" id="L10"><a href="#L10">  10</a> </span>
+<span class="source-line" id="L11"><a href="#L11">  11</a> try:</span>
+<span class="source-line" id="L12"><a href="#L12">  12</a>     import pyarrow.parquet as pq</span>
+<span class="source-line" id="L13"><a href="#L13">  13</a> except ImportError:</span>
+<span class="source-line" id="L14"><a href="#L14">  14</a>     pq = None</span>
+<span class="source-line" id="L15"><a href="#L15">  15</a> </span>
+<span class="source-line" id="L16"><a href="#L16">  16</a> from slime.observability.timer import Timer</span>
+<span class="source-line" id="L17"><a href="#L17">  17</a> from slime.utils.types import MultimodalTypes, Sample</span>
+<span class="source-line" id="L18"><a href="#L18">  18</a> </span>
+<span class="source-line" id="L19"><a href="#L19">  19</a> __all__ = [&quot;Dataset&quot;, &quot;get_source&quot;]</span>
+<span class="source-line" id="L20"><a href="#L20">  20</a> </span>
+<span class="source-line" id="L21"><a href="#L21">  21</a> logger = logging.getLogger(__name__)</span>
+<span class="source-line" id="L22"><a href="#L22">  22</a> </span>
+<span class="source-line" id="L23"><a href="#L23">  23</a> </span>
+<span class="source-line" id="L24"><a href="#L24">  24</a> def read_file(path):</span>
+<span class="source-line" id="L25"><a href="#L25">  25</a>     path, row_slice = _parse_generalized_path(path)</span>
+<span class="source-line" id="L26"><a href="#L26">  26</a>     reader = None</span>
+<span class="source-line" id="L27"><a href="#L27">  27</a> </span>
+<span class="source-line" id="L28"><a href="#L28">  28</a>     if not os.path.exists(path):</span>
+<span class="source-line" id="L29"><a href="#L29">  29</a>         raise FileNotFoundError(f&quot;Prompt dataset path &#x27;{path}&#x27; does not exist.&quot;)</span>
+<span class="source-line" id="L30"><a href="#L30">  30</a> </span>
+<span class="source-line" id="L31"><a href="#L31">  31</a>     if path.endswith(&quot;.jsonl&quot;):</span>
+<span class="source-line" id="L32"><a href="#L32">  32</a> </span>
+<span class="source-line" id="L33"><a href="#L33">  33</a>         def jsonl_reader(p):</span>
+<span class="source-line" id="L34"><a href="#L34">  34</a>             with open(p, encoding=&quot;utf-8&quot;) as f:</span>
+<span class="source-line" id="L35"><a href="#L35">  35</a>                 for line_num, line in enumerate(f):</span>
+<span class="source-line" id="L36"><a href="#L36">  36</a>                     line = line.strip()</span>
+<span class="source-line" id="L37"><a href="#L37">  37</a>                     if not line:</span>
+<span class="source-line" id="L38"><a href="#L38">  38</a>                         continue</span>
+<span class="source-line" id="L39"><a href="#L39">  39</a>                     try:</span>
+<span class="source-line" id="L40"><a href="#L40">  40</a>                         yield json.loads(line)</span>
+<span class="source-line" id="L41"><a href="#L41">  41</a>                     except json.JSONDecodeError as e:</span>
+<span class="source-line" id="L42"><a href="#L42">  42</a>                         print(f&quot;JSON decode error at line {line_num}: {e}&quot;)</span>
+<span class="source-line" id="L43"><a href="#L43">  43</a>                         continue</span>
+<span class="source-line" id="L44"><a href="#L44">  44</a> </span>
+<span class="source-line" id="L45"><a href="#L45">  45</a>         reader = jsonl_reader(path)</span>
+<span class="source-line" id="L46"><a href="#L46">  46</a> </span>
+<span class="source-line" id="L47"><a href="#L47">  47</a>     elif path.endswith(&quot;.parquet&quot;):</span>
+<span class="source-line" id="L48"><a href="#L48">  48</a>         if pq is None:</span>
+<span class="source-line" id="L49"><a href="#L49">  49</a>             raise ImportError(&quot;pyarrow is required for parquet support&quot;)</span>
+<span class="source-line" id="L50"><a href="#L50">  50</a> </span>
+<span class="source-line" id="L51"><a href="#L51">  51</a>         def parquet_reader(p):</span>
+<span class="source-line" id="L52"><a href="#L52">  52</a>             pf = pq.ParquetFile(p)</span>
+<span class="source-line" id="L53"><a href="#L53">  53</a> </span>
+<span class="source-line" id="L54"><a href="#L54">  54</a>             for batch in pf.iter_batches():</span>
+<span class="source-line" id="L55"><a href="#L55">  55</a>                 yield from batch.to_pylist()</span>
+<span class="source-line" id="L56"><a href="#L56">  56</a> </span>
+<span class="source-line" id="L57"><a href="#L57">  57</a>         reader = parquet_reader(path)</span>
+<span class="source-line" id="L58"><a href="#L58">  58</a> </span>
+<span class="source-line" id="L59"><a href="#L59">  59</a>     else:</span>
+<span class="source-line" id="L60"><a href="#L60">  60</a>         raise ValueError(f&quot;Unsupported file format: {path}. Supported formats are .jsonl and .parquet.&quot;)</span>
+<span class="source-line" id="L61"><a href="#L61">  61</a> </span>
+<span class="source-line" id="L62"><a href="#L62">  62</a>     if row_slice is not None:</span>
+<span class="source-line" id="L63"><a href="#L63">  63</a> </span>
+<span class="source-line" id="L64"><a href="#L64">  64</a>         logger.info(&quot;read_file path=%s applying slice row_slice=%s&quot;, path, row_slice)</span>
+<span class="source-line" id="L65"><a href="#L65">  65</a>         if (row_slice.start or 0) &lt; 0 or (row_slice.stop or 0) &lt; 0:</span>
+<span class="source-line" id="L66"><a href="#L66">  66</a>             # islice forbids negative indices, but the @[...] syntax accepts</span>
+<span class="source-line" id="L67"><a href="#L67">  67</a>             # them (e.g. &quot;@[-100:]&quot; = the last 100 rows). Resolving a negative</span>
+<span class="source-line" id="L68"><a href="#L68">  68</a>             # bound needs the total row count, so materialize for this case and</span>
+<span class="source-line" id="L69"><a href="#L69">  69</a>             # keep the streaming islice for plain non-negative slices.</span>
+<span class="source-line" id="L70"><a href="#L70">  70</a>             reader = iter(list(reader)[row_slice])</span>
+<span class="source-line" id="L71"><a href="#L71">  71</a>         else:</span>
+<span class="source-line" id="L72"><a href="#L72">  72</a>             reader = itertools.islice(reader, row_slice.start, row_slice.stop, row_slice.step)</span>
+<span class="source-line" id="L73"><a href="#L73">  73</a> </span>
+<span class="source-line" id="L74"><a href="#L74">  74</a>     yield from reader</span>
+<span class="source-line" id="L75"><a href="#L75">  75</a> </span>
+<span class="source-line" id="L76"><a href="#L76">  76</a> </span>
+<span class="source-line" id="L77"><a href="#L77">  77</a> def _parse_generalized_path(s: str):</span>
+<span class="source-line" id="L78"><a href="#L78">  78</a>     if (m := re.match(r&quot;^(?P&lt;real_path&gt;.*)@\[(?P&lt;start&gt;-?\d*):(?P&lt;end&gt;-?\d*)\]$&quot;, s)) is not None:</span>
+<span class="source-line" id="L79"><a href="#L79">  79</a>         path = m.group(&quot;real_path&quot;)</span>
+<span class="source-line" id="L80"><a href="#L80">  80</a>         start = int(x) if (x := m.group(&quot;start&quot;)) != &quot;&quot; else None</span>
+<span class="source-line" id="L81"><a href="#L81">  81</a>         end = int(x) if (x := m.group(&quot;end&quot;)) != &quot;&quot; else None</span>
+<span class="source-line" id="L82"><a href="#L82">  82</a>         return path, slice(start, end)</span>
+<span class="source-line" id="L83"><a href="#L83">  83</a> </span>
+<span class="source-line" id="L84"><a href="#L84">  84</a>     return s, None</span>
+<span class="source-line" id="L85"><a href="#L85">  85</a> </span>
+<span class="source-line" id="L86"><a href="#L86">  86</a> </span>
+<span class="source-line" id="L87"><a href="#L87">  87</a> def filter_long_prompt(origin_samples: list[Sample], tokenizer, processor, max_length: int | None) -&gt; list[Sample]:</span>
+<span class="source-line" id="L88"><a href="#L88">  88</a>     if max_length is None:</span>
+<span class="source-line" id="L89"><a href="#L89">  89</a>         return origin_samples</span>
+<span class="source-line" id="L90"><a href="#L90">  90</a> </span>
+<span class="source-line" id="L91"><a href="#L91">  91</a>     if not isinstance(origin_samples[0].prompt, str):</span>
+<span class="source-line" id="L92"><a href="#L92">  92</a>         logger.warning(</span>
+<span class="source-line" id="L93"><a href="#L93">  93</a>             &quot;Skipping max_length check for list prompt. Set apply_chat_template=True to enable length filtering.&quot;</span>
+<span class="source-line" id="L94"><a href="#L94">  94</a>         )</span>
+<span class="source-line" id="L95"><a href="#L95">  95</a>         return origin_samples</span>
+<span class="source-line" id="L96"><a href="#L96">  96</a> </span>
+<span class="source-line" id="L97"><a href="#L97">  97</a>     if processor:</span>
+<span class="source-line" id="L98"><a href="#L98">  98</a>         # Use processor only for samples with actual multimodal content; use batched tokenizer for text-only.</span>
+<span class="source-line" id="L99"><a href="#L99">  99</a>         text_only = []</span>
+<span class="source-line" id="L100"><a href="#L100"> 100</a>         multimodal = []</span>
+<span class="source-line" id="L101"><a href="#L101"> 101</a>         for position, sample in enumerate(origin_samples):</span>
+<span class="source-line" id="L102"><a href="#L102"> 102</a>             if sample.multimodal_inputs and any(v is not None for v in sample.multimodal_inputs.values()):</span>
+<span class="source-line" id="L103"><a href="#L103"> 103</a>                 multimodal.append((position, sample))</span>
+<span class="source-line" id="L104"><a href="#L104"> 104</a>             else:</span>
+<span class="source-line" id="L105"><a href="#L105"> 105</a>                 text_only.append((position, sample))</span>
+<span class="source-line" id="L106"><a href="#L106"> 106</a>         kept = []</span>
+<span class="source-line" id="L107"><a href="#L107"> 107</a>         if text_only:</span>
+<span class="source-line" id="L108"><a href="#L108"> 108</a>             prompts = [s.prompt for _, s in text_only]</span>
+<span class="source-line" id="L109"><a href="#L109"> 109</a>             input_ids_list = tokenizer(prompts, add_special_tokens=False)[&quot;input_ids&quot;]</span>
+<span class="source-line" id="L110"><a href="#L110"> 110</a>             for (position, sample), input_ids in zip(text_only, input_ids_list, strict=True):</span>
+<span class="source-line" id="L111"><a href="#L111"> 111</a>                 if len(input_ids) &lt;= max_length:</span>
+<span class="source-line" id="L112"><a href="#L112"> 112</a>                     kept.append((position, sample))</span>
+<span class="source-line" id="L113"><a href="#L113"> 113</a>         if multimodal:</span>
+<span class="source-line" id="L114"><a href="#L114"> 114</a>             from slime.utils.processing_utils import process_vision_info</span>
+<span class="source-line" id="L115"><a href="#L115"> 115</a> </span>
+<span class="source-line" id="L116"><a href="#L116"> 116</a>             for position, sample in multimodal:</span>
+<span class="source-line" id="L117"><a href="#L117"> 117</a>                 multimodal_inputs = process_vision_info(sample.prompt, processor)</span>
+<span class="source-line" id="L118"><a href="#L118"> 118</a>                 processor_output = processor(text=sample.prompt, **multimodal_inputs)</span>
+<span class="source-line" id="L119"><a href="#L119"> 119</a>                 input_ids = processor_output[&quot;input_ids&quot;][0]</span>
+<span class="source-line" id="L120"><a href="#L120"> 120</a>                 if len(input_ids) &lt;= max_length:</span>
+<span class="source-line" id="L121"><a href="#L121"> 121</a>                     kept.append((position, sample))</span>
+<span class="source-line" id="L122"><a href="#L122"> 122</a>         # The two groups are scored separately for throughput, so restore the</span>
+<span class="source-line" id="L123"><a href="#L123"> 123</a>         # dataset order here: without --rollout-shuffle the samples are consumed</span>
+<span class="source-line" id="L124"><a href="#L124"> 124</a>         # in this order, and training should not depend on which of them happen</span>
+<span class="source-line" id="L125"><a href="#L125"> 125</a>         # to carry multimodal content.</span>
+<span class="source-line" id="L126"><a href="#L126"> 126</a>         kept.sort(key=lambda position_and_sample: position_and_sample[0])</span>
+<span class="source-line" id="L127"><a href="#L127"> 127</a>         filtered_samples = [sample for _, sample in kept]</span>
+<span class="source-line" id="L128"><a href="#L128"> 128</a>     else:</span>
+<span class="source-line" id="L129"><a href="#L129"> 129</a>         prompts = [sample.prompt for sample in origin_samples]</span>
+<span class="source-line" id="L130"><a href="#L130"> 130</a>         input_ids_list = tokenizer(prompts, add_special_tokens=False)[&quot;input_ids&quot;]</span>
+<span class="source-line" id="L131"><a href="#L131"> 131</a>         filtered_samples = [</span>
+<span class="source-line" id="L132"><a href="#L132"> 132</a>             sample</span>
+<span class="source-line" id="L133"><a href="#L133"> 133</a>             for sample, input_ids in zip(origin_samples, input_ids_list, strict=True)</span>
+<span class="source-line" id="L134"><a href="#L134"> 134</a>             if len(input_ids) &lt;= max_length</span>
+<span class="source-line" id="L135"><a href="#L135"> 135</a>         ]</span>
+<span class="source-line" id="L136"><a href="#L136"> 136</a> </span>
+<span class="source-line" id="L137"><a href="#L137"> 137</a>     logger.info(f&quot;Filtered {len(origin_samples) - len(filtered_samples)} samples longer than max_length={max_length}.&quot;)</span>
+<span class="source-line" id="L138"><a href="#L138"> 138</a> </span>
+<span class="source-line" id="L139"><a href="#L139"> 139</a>     return filtered_samples</span>
+<span class="source-line" id="L140"><a href="#L140"> 140</a> </span>
+<span class="source-line" id="L141"><a href="#L141"> 141</a> </span>
+<span class="source-line" id="L142"><a href="#L142"> 142</a> def _build_messages(data: dict, prompt_key: str, as_conversation: bool, multimodal_keys: dict = None):</span>
+<span class="source-line" id="L143"><a href="#L143"> 143</a>     prompt = data.get(prompt_key)</span>
+<span class="source-line" id="L144"><a href="#L144"> 144</a> </span>
+<span class="source-line" id="L145"><a href="#L145"> 145</a>     if isinstance(prompt, str):</span>
+<span class="source-line" id="L146"><a href="#L146"> 146</a>         # If prompt is a string and we don&#x27;t apply chat template, return the prompt as is.</span>
+<span class="source-line" id="L147"><a href="#L147"> 147</a>         if not as_conversation:</span>
+<span class="source-line" id="L148"><a href="#L148"> 148</a>             return prompt</span>
+<span class="source-line" id="L149"><a href="#L149"> 149</a>         else:</span>
+<span class="source-line" id="L150"><a href="#L150"> 150</a>             prompt = [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: prompt}]</span>
+<span class="source-line" id="L151"><a href="#L151"> 151</a> </span>
+<span class="source-line" id="L152"><a href="#L152"> 152</a>     if multimodal_keys:</span>
+<span class="source-line" id="L153"><a href="#L153"> 153</a>         # Build mapping: placeholder -&gt; (MultimodalType, content_list)</span>
+<span class="source-line" id="L154"><a href="#L154"> 154</a>         multimodals = {}</span>
+<span class="source-line" id="L155"><a href="#L155"> 155</a>         for type_name, data_key in multimodal_keys.items():</span>
+<span class="source-line" id="L156"><a href="#L156"> 156</a>             mt = MultimodalTypes.get(type_name)</span>
+<span class="source-line" id="L157"><a href="#L157"> 157</a>             if mt:</span>
+<span class="source-line" id="L158"><a href="#L158"> 158</a>                 multimodal_data = data.get(data_key)</span>
+<span class="source-line" id="L159"><a href="#L159"> 159</a>                 if multimodal_data is not None:</span>
+<span class="source-line" id="L160"><a href="#L160"> 160</a>                     multimodals[mt.placeholder] = (mt, list(multimodal_data))</span>
+<span class="source-line" id="L161"><a href="#L161"> 161</a> </span>
+<span class="source-line" id="L162"><a href="#L162"> 162</a>         pattern = &quot;(&quot; + &quot;|&quot;.join(re.escape(p) for p in multimodals.keys()) + &quot;)&quot;</span>
+<span class="source-line" id="L163"><a href="#L163"> 163</a> </span>
+<span class="source-line" id="L164"><a href="#L164"> 164</a>         for message in prompt:</span>
+<span class="source-line" id="L165"><a href="#L165"> 165</a>             if isinstance(message[&quot;content&quot;], str):</span>
+<span class="source-line" id="L166"><a href="#L166"> 166</a>                 content_list = []</span>
+<span class="source-line" id="L167"><a href="#L167"> 167</a>                 for segment in re.split(pattern, message[&quot;content&quot;]):</span>
+<span class="source-line" id="L168"><a href="#L168"> 168</a>                     if not segment:</span>
+<span class="source-line" id="L169"><a href="#L169"> 169</a>                         continue</span>
+<span class="source-line" id="L170"><a href="#L170"> 170</a>                     if segment in multimodals:</span>
+<span class="source-line" id="L171"><a href="#L171"> 171</a>                         mt, content = multimodals[segment]</span>
+<span class="source-line" id="L172"><a href="#L172"> 172</a>                         assert len(content) &gt; 0, (</span>
+<span class="source-line" id="L173"><a href="#L173"> 173</a>                             f&quot;Not enough {mt.name} data: more &#x27;{mt.placeholder}&#x27; placeholders in prompt &quot;</span>
+<span class="source-line" id="L174"><a href="#L174"> 174</a>                             f&quot;than {mt.name}s provided in data&quot;</span>
+<span class="source-line" id="L175"><a href="#L175"> 175</a>                         )</span>
+<span class="source-line" id="L176"><a href="#L176"> 176</a>                         item = content.pop(0)</span>
+<span class="source-line" id="L177"><a href="#L177"> 177</a>                         # Support rich image config from https://github.com/QwenLM/Qwen3-VL/blob/main/README.md</span>
+<span class="source-line" id="L178"><a href="#L178"> 178</a>                         # &quot;images&quot;: [{&quot;type&quot;: &quot;image&quot;, &quot;image&quot;: &quot;path/to/img/01.jpeg&quot;, &quot;max_pixels&quot;: 50176, &quot;min_pixels&quot;: 50176}, {...}]</span>
+<span class="source-line" id="L179"><a href="#L179"> 179</a>                         if isinstance(item, dict):</span>
+<span class="source-line" id="L180"><a href="#L180"> 180</a>                             content_list.append(item)</span>
+<span class="source-line" id="L181"><a href="#L181"> 181</a>                         # &quot;images&quot;: [&quot;path/to/img/01.jpeg&quot;, &quot;url&quot;, &quot;base64enc&quot;]</span>
+<span class="source-line" id="L182"><a href="#L182"> 182</a>                         else:</span>
+<span class="source-line" id="L183"><a href="#L183"> 183</a>                             content_list.append({&quot;type&quot;: mt.name, mt.name: item})</span>
+<span class="source-line" id="L184"><a href="#L184"> 184</a>                     else:</span>
+<span class="source-line" id="L185"><a href="#L185"> 185</a>                         content_list.append({&quot;type&quot;: &quot;text&quot;, &quot;text&quot;: segment})</span>
+<span class="source-line" id="L186"><a href="#L186"> 186</a>                 message[&quot;content&quot;] = content_list</span>
+<span class="source-line" id="L187"><a href="#L187"> 187</a> </span>
+<span class="source-line" id="L188"><a href="#L188"> 188</a>             elif isinstance(message[&quot;content&quot;], list):</span>
+<span class="source-line" id="L189"><a href="#L189"> 189</a>                 # TODO: handle more general cases. where message[&#x27;content&#x27;] is a dict and contains multiple types of content.</span>
+<span class="source-line" id="L190"><a href="#L190"> 190</a>                 # e.g.</span>
+<span class="source-line" id="L191"><a href="#L191"> 191</a>                 #  &quot;content&quot;: [</span>
+<span class="source-line" id="L192"><a href="#L192"> 192</a>                 #     {</span>
+<span class="source-line" id="L193"><a href="#L193"> 193</a>                 #         &quot;type&quot;: &quot;image&quot;,</span>
+<span class="source-line" id="L194"><a href="#L194"> 194</a>                 #         &quot;image&quot;: &quot;https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg&quot;,</span>
+<span class="source-line" id="L195"><a href="#L195"> 195</a>                 #     },</span>
+<span class="source-line" id="L196"><a href="#L196"> 196</a>                 #     {&quot;type&quot;: &quot;text&quot;, &quot;text&quot;: &quot;Describe this image.&quot;},</span>
+<span class="source-line" id="L197"><a href="#L197"> 197</a>                 # ],</span>
+<span class="source-line" id="L198"><a href="#L198"> 198</a>                 logger.warning(&quot;message[&#x27;content&#x27;] is a list of dicts, no processing will be done.&quot;)</span>
+<span class="source-line" id="L199"><a href="#L199"> 199</a>                 continue</span>
+<span class="source-line" id="L200"><a href="#L200"> 200</a>             else:</span>
+<span class="source-line" id="L201"><a href="#L201"> 201</a>                 raise ValueError(</span>
+<span class="source-line" id="L202"><a href="#L202"> 202</a>                     f&quot;Unsupported content type: {type(message[&#x27;content&#x27;])}, expected str or list of dicts&quot;</span>
+<span class="source-line" id="L203"><a href="#L203"> 203</a>                 )</span>
+<span class="source-line" id="L204"><a href="#L204"> 204</a> </span>
+<span class="source-line" id="L205"><a href="#L205"> 205</a>         for placeholder, (mt, remaining) in multimodals.items():</span>
+<span class="source-line" id="L206"><a href="#L206"> 206</a>             assert len(remaining) == 0, (</span>
+<span class="source-line" id="L207"><a href="#L207"> 207</a>                 f&quot;Multimodal data count mismatch: {len(remaining)} more {mt.name}(s)&quot;</span>
+<span class="source-line" id="L208"><a href="#L208"> 208</a>                 f&quot;than &#x27;{placeholder}&#x27; placeholders in prompt&quot;</span>
+<span class="source-line" id="L209"><a href="#L209"> 209</a>             )</span>
+<span class="source-line" id="L210"><a href="#L210"> 210</a> </span>
+<span class="source-line" id="L211"><a href="#L211"> 211</a>     return prompt</span>
+<span class="source-line" id="L212"><a href="#L212"> 212</a> </span>
+<span class="source-line" id="L213"><a href="#L213"> 213</a> </span>
+<span class="source-line" id="L214"><a href="#L214"> 214</a> class Dataset:</span>
+<span class="source-line" id="L215"><a href="#L215"> 215</a>     def __init__(</span>
+<span class="source-line" id="L216"><a href="#L216"> 216</a>         self,</span>
+<span class="source-line" id="L217"><a href="#L217"> 217</a>         path,</span>
+<span class="source-line" id="L218"><a href="#L218"> 218</a>         tokenizer,</span>
+<span class="source-line" id="L219"><a href="#L219"> 219</a>         processor,</span>
+<span class="source-line" id="L220"><a href="#L220"> 220</a>         max_length,</span>
+<span class="source-line" id="L221"><a href="#L221"> 221</a>         *,</span>
+<span class="source-line" id="L222"><a href="#L222"> 222</a>         prompt_key=&quot;text&quot;,</span>
+<span class="source-line" id="L223"><a href="#L223"> 223</a>         multimodal_keys=None,</span>
+<span class="source-line" id="L224"><a href="#L224"> 224</a>         label_key=None,</span>
+<span class="source-line" id="L225"><a href="#L225"> 225</a>         tool_key=None,</span>
+<span class="source-line" id="L226"><a href="#L226"> 226</a>         metadata_key=&quot;metadata&quot;,</span>
+<span class="source-line" id="L227"><a href="#L227"> 227</a>         seed=42,</span>
+<span class="source-line" id="L228"><a href="#L228"> 228</a>         apply_chat_template=False,</span>
+<span class="source-line" id="L229"><a href="#L229"> 229</a>         apply_chat_template_kwargs=None,</span>
+<span class="source-line" id="L230"><a href="#L230"> 230</a>     ):</span>
+<span class="source-line" id="L231"><a href="#L231"> 231</a>         origin_samples = []</span>
+<span class="source-line" id="L232"><a href="#L232"> 232</a>         for data in read_file(path):</span>
+<span class="source-line" id="L233"><a href="#L233"> 233</a>             # Both chat templates and multimodal inputs require conversation format (list of message dicts)</span>
+<span class="source-line" id="L234"><a href="#L234"> 234</a>             as_conversation = apply_chat_template or (multimodal_keys is not None)</span>
+<span class="source-line" id="L235"><a href="#L235"> 235</a>             prompt = _build_messages(data, prompt_key, as_conversation, multimodal_keys)</span>
+<span class="source-line" id="L236"><a href="#L236"> 236</a> </span>
+<span class="source-line" id="L237"><a href="#L237"> 237</a>             metadata = data.get(metadata_key) or {}</span>
+<span class="source-line" id="L238"><a href="#L238"> 238</a>             tools = None</span>
+<span class="source-line" id="L239"><a href="#L239"> 239</a>             if tool_key is not None and tool_key in data:</span>
+<span class="source-line" id="L240"><a href="#L240"> 240</a>                 tools = data[tool_key]</span>
+<span class="source-line" id="L241"><a href="#L241"> 241</a>                 if isinstance(tools, str):</span>
+<span class="source-line" id="L242"><a href="#L242"> 242</a>                     tools = json.loads(tools)</span>
+<span class="source-line" id="L243"><a href="#L243"> 243</a>                 elif isinstance(tools, np.ndarray):</span>
+<span class="source-line" id="L244"><a href="#L244"> 244</a>                     tools = tools.tolist()</span>
+<span class="source-line" id="L245"><a href="#L245"> 245</a>                 assert isinstance(tools, list), f&quot;tools must be a list, got {type(tools)} instead&quot;</span>
+<span class="source-line" id="L246"><a href="#L246"> 246</a>                 metadata[&quot;tools&quot;] = tools</span>
+<span class="source-line" id="L247"><a href="#L247"> 247</a> </span>
+<span class="source-line" id="L248"><a href="#L248"> 248</a>             if apply_chat_template:</span>
+<span class="source-line" id="L249"><a href="#L249"> 249</a>                 output_prompt = tokenizer.apply_chat_template(</span>
+<span class="source-line" id="L250"><a href="#L250"> 250</a>                     prompt,</span>
+<span class="source-line" id="L251"><a href="#L251"> 251</a>                     tools=tools,</span>
+<span class="source-line" id="L252"><a href="#L252"> 252</a>                     tokenize=False,</span>
+<span class="source-line" id="L253"><a href="#L253"> 253</a>                     add_generation_prompt=True,</span>
+<span class="source-line" id="L254"><a href="#L254"> 254</a>                     **(apply_chat_template_kwargs or {}),</span>
+<span class="source-line" id="L255"><a href="#L255"> 255</a>                 )</span>
+<span class="source-line" id="L256"><a href="#L256"> 256</a>             else:</span>
+<span class="source-line" id="L257"><a href="#L257"> 257</a>                 output_prompt = prompt</span>
+<span class="source-line" id="L258"><a href="#L258"> 258</a> </span>
+<span class="source-line" id="L259"><a href="#L259"> 259</a>             if processor:</span>
+<span class="source-line" id="L260"><a href="#L260"> 260</a>                 from slime.utils.processing_utils import process_vision_info</span>
+<span class="source-line" id="L261"><a href="#L261"> 261</a> </span>
+<span class="source-line" id="L262"><a href="#L262"> 262</a>                 assert isinstance(</span>
+<span class="source-line" id="L263"><a href="#L263"> 263</a>                     prompt, list</span>
+<span class="source-line" id="L264"><a href="#L264"> 264</a>                 ), f&quot;prompt must be a list when processor is not None, got {type(prompt)} instead&quot;</span>
+<span class="source-line" id="L265"><a href="#L265"> 265</a>                 multimodal_inputs = process_vision_info(prompt, processor)</span>
+<span class="source-line" id="L266"><a href="#L266"> 266</a>             else:</span>
+<span class="source-line" id="L267"><a href="#L267"> 267</a>                 multimodal_inputs = None</span>
+<span class="source-line" id="L268"><a href="#L268"> 268</a> </span>
+<span class="source-line" id="L269"><a href="#L269"> 269</a>             origin_samples.append(</span>
+<span class="source-line" id="L270"><a href="#L270"> 270</a>                 Sample(</span>
+<span class="source-line" id="L271"><a href="#L271"> 271</a>                     prompt=output_prompt,</span>
+<span class="source-line" id="L272"><a href="#L272"> 272</a>                     label=data[label_key] if label_key is not None else None,</span>
+<span class="source-line" id="L273"><a href="#L273"> 273</a>                     metadata=metadata,</span>
+<span class="source-line" id="L274"><a href="#L274"> 274</a>                     multimodal_inputs=multimodal_inputs,</span>
+<span class="source-line" id="L275"><a href="#L275"> 275</a>                 )</span>
+<span class="source-line" id="L276"><a href="#L276"> 276</a>             )</span>
+<span class="source-line" id="L277"><a href="#L277"> 277</a> </span>
+<span class="source-line" id="L278"><a href="#L278"> 278</a>         if max_length is not None:</span>
+<span class="source-line" id="L279"><a href="#L279"> 279</a>             self.origin_samples = filter_long_prompt(origin_samples, tokenizer, processor, max_length)</span>
+<span class="source-line" id="L280"><a href="#L280"> 280</a>         else:</span>
+<span class="source-line" id="L281"><a href="#L281"> 281</a>             self.origin_samples = origin_samples</span>
+<span class="source-line" id="L282"><a href="#L282"> 282</a> </span>
+<span class="source-line" id="L283"><a href="#L283"> 283</a>         self.epoch_id = -1</span>
+<span class="source-line" id="L284"><a href="#L284"> 284</a>         self.seed = seed</span>
+<span class="source-line" id="L285"><a href="#L285"> 285</a>         self.samples = self.origin_samples</span>
+<span class="source-line" id="L286"><a href="#L286"> 286</a> </span>
+<span class="source-line" id="L287"><a href="#L287"> 287</a>     def shuffle(self, new_epoch_id):</span>
+<span class="source-line" id="L288"><a href="#L288"> 288</a>         if self.epoch_id == new_epoch_id:</span>
+<span class="source-line" id="L289"><a href="#L289"> 289</a>             return</span>
+<span class="source-line" id="L290"><a href="#L290"> 290</a> </span>
+<span class="source-line" id="L291"><a href="#L291"> 291</a>         random.seed(self.seed + new_epoch_id)</span>
+<span class="source-line" id="L292"><a href="#L292"> 292</a>         permutation = list(range(len(self.samples)))</span>
+<span class="source-line" id="L293"><a href="#L293"> 293</a>         random.shuffle(permutation)</span>
+<span class="source-line" id="L294"><a href="#L294"> 294</a>         self.samples = [self.origin_samples[i] for i in permutation]</span>
+<span class="source-line" id="L295"><a href="#L295"> 295</a>         self.epoch_id = new_epoch_id</span>
+<span class="source-line" id="L296"><a href="#L296"> 296</a> </span>
+<span class="source-line" id="L297"><a href="#L297"> 297</a>     def __getitem__(self, idx):</span>
+<span class="source-line" id="L298"><a href="#L298"> 298</a>         return self.samples[idx]</span>
+<span class="source-line" id="L299"><a href="#L299"> 299</a> </span>
+<span class="source-line" id="L300"><a href="#L300"> 300</a>     def __len__(self):</span>
+<span class="source-line" id="L301"><a href="#L301"> 301</a>         return len(self.samples)</span>
+<span class="source-line" id="L302"><a href="#L302"> 302</a> </span>
+<span class="source-line" id="L303"><a href="#L303"> 303</a> </span>
+<span class="source-line" id="L304"><a href="#L304"> 304</a> def process_rollout_data(rollout_data_ref, dp_rank, dp_size):</span>
+<span class="source-line" id="L305"><a href="#L305"> 305</a>     assert len(rollout_data_ref) == dp_size</span>
+<span class="source-line" id="L306"><a href="#L306"> 306</a>     rollout_data = ray.get(rollout_data_ref[dp_rank].inner)</span>
+<span class="source-line" id="L307"><a href="#L307"> 307</a> </span>
+<span class="source-line" id="L308"><a href="#L308"> 308</a>     # Keep `partition` in rollout_data: each local sample&#x27;s position in the</span>
+<span class="source-line" id="L309"><a href="#L309"> 309</a>     # flattened rollout batch (== its index in the rollout debug dump&#x27;s</span>
+<span class="source-line" id="L310"><a href="#L310"> 310</a>     # `samples`). It&#x27;s a small list of ints, only read by the train debug dump /</span>
+<span class="source-line" id="L311"><a href="#L311"> 311</a>     # log-prob capture, and ignored by training (the data iterator only fetches</span>
+<span class="source-line" id="L312"><a href="#L312"> 312</a>     # requested keys), so there&#x27;s no need to drop it.</span>
+<span class="source-line" id="L313"><a href="#L313"> 313</a>     partition = rollout_data[&quot;partition&quot;]</span>
+<span class="source-line" id="L314"><a href="#L314"> 314</a>     total_lengths = rollout_data[&quot;total_lengths&quot;]</span>
+<span class="source-line" id="L315"><a href="#L315"> 315</a> </span>
+<span class="source-line" id="L316"><a href="#L316"> 316</a>     # save the seqlen of the whole rollout batch</span>
+<span class="source-line" id="L317"><a href="#L317"> 317</a>     Timer().seq_lens = total_lengths</span>
+<span class="source-line" id="L318"><a href="#L318"> 318</a>     rollout_data[&quot;total_lengths&quot;] = [total_lengths[i] for i in partition]</span>
+<span class="source-line" id="L319"><a href="#L319"> 319</a> </span>
+<span class="source-line" id="L320"><a href="#L320"> 320</a>     # `raw_reward` is shipped whole on purpose: log_passrate reshapes it into</span>
+<span class="source-line" id="L321"><a href="#L321"> 321</a>     # [rollout_batch_size, n_samples_per_prompt] groups, which only works on the</span>
+<span class="source-line" id="L322"><a href="#L322"> 322</a>     # full rollout batch. Metrics that pair a reward with this rank&#x27;s per-sample</span>
+<span class="source-line" id="L323"><a href="#L323"> 323</a>     # lists (response_lengths, loss_masks, log_probs, ...) need the DP-local</span>
+<span class="source-line" id="L324"><a href="#L324"> 324</a>     # view instead, otherwise sample i&#x27;s reward is matched against another</span>
+<span class="source-line" id="L325"><a href="#L325"> 325</a>     # sample&#x27;s data.</span>
+<span class="source-line" id="L326"><a href="#L326"> 326</a>     if &quot;raw_reward&quot; in rollout_data:</span>
+<span class="source-line" id="L327"><a href="#L327"> 327</a>         rollout_data[&quot;local_raw_reward&quot;] = [rollout_data[&quot;raw_reward&quot;][i] for i in partition]</span>
+<span class="source-line" id="L328"><a href="#L328"> 328</a> </span>
+<span class="source-line" id="L329"><a href="#L329"> 329</a>     return rollout_data</span>
+<span class="source-line" id="L330"><a href="#L330"> 330</a> </span>
+<span class="source-line" id="L331"><a href="#L331"> 331</a> </span>
+<span class="source-line" id="L332"><a href="#L332"> 332</a> def get_source(sample: Sample) -&gt; str:</span>
+<span class="source-line" id="L333"><a href="#L333"> 333</a>     metadata = getattr(sample, &quot;metadata&quot;, None) or {}</span>
+<span class="source-line" id="L334"><a href="#L334"> 334</a>     if getattr(sample, &quot;source&quot;, None):</span>
+<span class="source-line" id="L335"><a href="#L335"> 335</a>         return sample.source</span>
+<span class="source-line" id="L336"><a href="#L336"> 336</a>     if metadata.get(&quot;source_name&quot;):</span>
+<span class="source-line" id="L337"><a href="#L337"> 337</a>         return metadata[&quot;source_name&quot;]</span>
+<span class="source-line" id="L338"><a href="#L338"> 338</a>     return &quot;unknown&quot;</span></code></pre></main></body></html>

@@ -1,0 +1,85 @@
+<!doctype html><html lang="zh-Hans"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="description" content="从 Ray 入门到读懂 slime/ray：基于固定源码的中文交互教程。">
+<title>slime/ray/utils.py · Ray 与 slime 源码导读</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="../../../assets/style.css">
+<link rel="stylesheet" href="../../../assets/tutorial.css"></head><body class="source-page"><header class="topbar">
+<a class="brand" href="../../../index.html">Ray 与 slime</a><a href="https://github.com/THUDM/slime/blob/5bae5bb7928d65906e24e99f5b5d3f99a4daaf93/slime/ray/utils.py">GitHub 固定版本 ↗</a></header>
+<main class="source-wrap"><p><a href="../../../chapters/sources.html">← 源码索引</a> · 5bae5bb7928d · 只读快照</p>
+<h1>slime/ray/utils.py</h1><pre class="source-code"><code><span class="source-line" id="L1"><a href="#L1">   1</a> # Adapted from https://github.com/OpenRLHF/OpenRLHF/blob/10c733694ed9fbb78a0a2ff6a05efc7401584d46/openrlhf/trainer/ray/utils.py#L1</span>
+<span class="source-line" id="L2"><a href="#L2">   2</a> import os</span>
+<span class="source-line" id="L3"><a href="#L3">   3</a> </span>
+<span class="source-line" id="L4"><a href="#L4">   4</a> import ray</span>
+<span class="source-line" id="L5"><a href="#L5">   5</a> </span>
+<span class="source-line" id="L6"><a href="#L6">   6</a> from slime.ray.ray_actor import RayActor</span>
+<span class="source-line" id="L7"><a href="#L7">   7</a> from slime.utils import accelerator</span>
+<span class="source-line" id="L8"><a href="#L8">   8</a> </span>
+<span class="source-line" id="L9"><a href="#L9">   9</a> # Refer to</span>
+<span class="source-line" id="L10"><a href="#L10">  10</a> # https://github.com/ray-project/ray/blob/161849364a784442cc659fb9780f1a6adee85fce/python/ray/_private/accelerators/nvidia_gpu.py#L95-L96</span>
+<span class="source-line" id="L11"><a href="#L11">  11</a> # https://github.com/ray-project/ray/blob/161849364a784442cc659fb9780f1a6adee85fce/python/ray/_private/accelerators/amd_gpu.py#L102-L103</span>
+<span class="source-line" id="L12"><a href="#L12">  12</a> # https://github.com/ray-project/ray/blob/161849364a784442cc659fb9780f1a6adee85fce/python/ray/_private/accelerators/npu.py#L94-L95</span>
+<span class="source-line" id="L13"><a href="#L13">  13</a> # https://github.com/ray-project/ray/blob/161849364a784442cc659fb9780f1a6adee85fce/python/ray/_private/accelerators/hpu.py#L116-L117</span>
+<span class="source-line" id="L14"><a href="#L14">  14</a> # https://github.com/ray-project/ray/blob/161849364a784442cc659fb9780f1a6adee85fce/python/ray/_private/accelerators/neuron.py#L108-L109</span>
+<span class="source-line" id="L15"><a href="#L15">  15</a> # https://github.com/ray-project/ray/blob/161849364a784442cc659fb9780f1a6adee85fce/python/ray/_private/accelerators/tpu.py#L171-L172</span>
+<span class="source-line" id="L16"><a href="#L16">  16</a> # https://github.com/ray-project/ray/blob/161849364a784442cc659fb9780f1a6adee85fce/python/ray/_private/accelerators/intel_gpu.py#L97-L98</span>
+<span class="source-line" id="L17"><a href="#L17">  17</a> NOSET_VISIBLE_DEVICES_ENV_VARS_LIST = [</span>
+<span class="source-line" id="L18"><a href="#L18">  18</a>     &quot;RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES&quot;,</span>
+<span class="source-line" id="L19"><a href="#L19">  19</a>     &quot;RAY_EXPERIMENTAL_NOSET_MUSA_VISIBLE_DEVICES&quot;,</span>
+<span class="source-line" id="L20"><a href="#L20">  20</a>     &quot;RAY_EXPERIMENTAL_NOSET_SUPA_VISIBLE_DEVICES&quot;,</span>
+<span class="source-line" id="L21"><a href="#L21">  21</a>     &quot;RAY_EXPERIMENTAL_NOSET_ROCR_VISIBLE_DEVICES&quot;,</span>
+<span class="source-line" id="L22"><a href="#L22">  22</a>     &quot;RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES&quot;,</span>
+<span class="source-line" id="L23"><a href="#L23">  23</a>     &quot;RAY_EXPERIMENTAL_NOSET_HABANA_VISIBLE_MODULES&quot;,</span>
+<span class="source-line" id="L24"><a href="#L24">  24</a>     &quot;RAY_EXPERIMENTAL_NOSET_NEURON_RT_VISIBLE_CORES&quot;,</span>
+<span class="source-line" id="L25"><a href="#L25">  25</a>     &quot;RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS&quot;,</span>
+<span class="source-line" id="L26"><a href="#L26">  26</a>     &quot;RAY_EXPERIMENTAL_NOSET_ONEAPI_DEVICE_SELECTOR&quot;,</span>
+<span class="source-line" id="L27"><a href="#L27">  27</a> ]</span>
+<span class="source-line" id="L28"><a href="#L28">  28</a> </span>
+<span class="source-line" id="L29"><a href="#L29">  29</a> RAY_DEFAULT_ENV_VARS = {</span>
+<span class="source-line" id="L30"><a href="#L30">  30</a>     # Ray&#x27;s uvloop integration has caused intermittent async actor issues.</span>
+<span class="source-line" id="L31"><a href="#L31">  31</a>     &quot;RAY_USE_UVLOOP&quot;: &quot;0&quot;,</span>
+<span class="source-line" id="L32"><a href="#L32">  32</a>     # Let sglang&#x27;s JIT loader (load_jit) find slime-hosted custom kernel .cuh</span>
+<span class="source-line" id="L33"><a href="#L33">  33</a>     # sources (e.g. glm5_router_gemm) and try-cache compile them, so they need</span>
+<span class="source-line" id="L34"><a href="#L34">  34</a>     # not be patched into the sglang source tree.</span>
+<span class="source-line" id="L35"><a href="#L35">  35</a>     &quot;SGLANG_JIT_KERNEL_EXTRA_PATH&quot;: os.path.join(</span>
+<span class="source-line" id="L36"><a href="#L36">  36</a>         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),</span>
+<span class="source-line" id="L37"><a href="#L37">  37</a>         &quot;backends&quot;,</span>
+<span class="source-line" id="L38"><a href="#L38">  38</a>         &quot;sglang_utils&quot;,</span>
+<span class="source-line" id="L39"><a href="#L39">  39</a>         &quot;jit_kernels&quot;,</span>
+<span class="source-line" id="L40"><a href="#L40">  40</a>     ),</span>
+<span class="source-line" id="L41"><a href="#L41">  41</a> }</span>
+<span class="source-line" id="L42"><a href="#L42">  42</a> </span>
+<span class="source-line" id="L43"><a href="#L43">  43</a> </span>
+<span class="source-line" id="L44"><a href="#L44">  44</a> def add_default_ray_env_vars(env_vars: dict[str, str] | None = None) -&gt; dict[str, str]:</span>
+<span class="source-line" id="L45"><a href="#L45">  45</a>     return RAY_DEFAULT_ENV_VARS | (env_vars or {})</span>
+<span class="source-line" id="L46"><a href="#L46">  46</a> </span>
+<span class="source-line" id="L47"><a href="#L47">  47</a> </span>
+<span class="source-line" id="L48"><a href="#L48">  48</a> def ray_noset_visible_devices(env_vars=os.environ):</span>
+<span class="source-line" id="L49"><a href="#L49">  49</a>     return any(env_vars.get(env_var) for env_var in NOSET_VISIBLE_DEVICES_ENV_VARS_LIST)</span>
+<span class="source-line" id="L50"><a href="#L50">  50</a> </span>
+<span class="source-line" id="L51"><a href="#L51">  51</a> </span>
+<span class="source-line" id="L52"><a href="#L52">  52</a> def get_physical_gpu_id():</span>
+<span class="source-line" id="L53"><a href="#L53">  53</a>     device = accelerator.current_device()</span>
+<span class="source-line" id="L54"><a href="#L54">  54</a>     props = accelerator.get_device_properties(device)</span>
+<span class="source-line" id="L55"><a href="#L55">  55</a>     return str(getattr(props, &quot;uuid&quot;, device))</span>
+<span class="source-line" id="L56"><a href="#L56">  56</a> </span>
+<span class="source-line" id="L57"><a href="#L57">  57</a> </span>
+<span class="source-line" id="L58"><a href="#L58">  58</a> @ray.remote</span>
+<span class="source-line" id="L59"><a href="#L59">  59</a> class Lock(RayActor):</span>
+<span class="source-line" id="L60"><a href="#L60">  60</a>     def __init__(self):</span>
+<span class="source-line" id="L61"><a href="#L61">  61</a>         self._locked = False  # False: unlocked, True: locked</span>
+<span class="source-line" id="L62"><a href="#L62">  62</a> </span>
+<span class="source-line" id="L63"><a href="#L63">  63</a>     def acquire(self):</span>
+<span class="source-line" id="L64"><a href="#L64">  64</a>         &quot;&quot;&quot;</span>
+<span class="source-line" id="L65"><a href="#L65">  65</a>         Try to acquire the lock. Returns True if acquired, False otherwise.</span>
+<span class="source-line" id="L66"><a href="#L66">  66</a>         Caller should retry until it returns True.</span>
+<span class="source-line" id="L67"><a href="#L67">  67</a>         &quot;&quot;&quot;</span>
+<span class="source-line" id="L68"><a href="#L68">  68</a>         if not self._locked:</span>
+<span class="source-line" id="L69"><a href="#L69">  69</a>             self._locked = True</span>
+<span class="source-line" id="L70"><a href="#L70">  70</a>             return True</span>
+<span class="source-line" id="L71"><a href="#L71">  71</a>         return False</span>
+<span class="source-line" id="L72"><a href="#L72">  72</a> </span>
+<span class="source-line" id="L73"><a href="#L73">  73</a>     def release(self):</span>
+<span class="source-line" id="L74"><a href="#L74">  74</a>         &quot;&quot;&quot;Release the lock, allowing others to acquire.&quot;&quot;&quot;</span>
+<span class="source-line" id="L75"><a href="#L75">  75</a>         assert self._locked, &quot;Lock is not acquired, cannot release.&quot;</span>
+<span class="source-line" id="L76"><a href="#L76">  76</a>         self._locked = False</span></code></pre></main></body></html>

@@ -1,0 +1,73 @@
+<!doctype html><html lang="zh-Hans"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="description" content="从 Ray 入门到读懂 slime/ray：基于固定源码的中文交互教程。">
+<title>同卡部署、卸载与进程释放 · Ray 与 slime 源码导读</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="stylesheet" href="../assets/tutorial.css"></head><body data-chapter="ch10" data-lab="">
+<a class="skip" href="#content">跳到正文</a>
+<header class="topbar"><a class="brand" href="../index.html">Ray 与 slime<span>源码导读</span></a>
+<nav class="chapnav"><a href="../index.html">全部章节</a><a href="sources.html">版本与证据</a></nav></header>
+<div class="layout"><aside class="sidebar"><nav class="toc" id="toc"><h2>本章目录</h2><details class="book-nav"><summary>全书章节</summary><a href="ch00.html">先看一轮训练怎样发生</a><a href="ch01.html">第一次 remote：任务与结果引用</a><a href="ch02.html">Actor：让模型留在一个进程里</a><a href="ch03.html">等待、依赖与背压</a><a href="ch04.html">先安排座位：Placement Group</a><a href="ch05.html">把训练 worker 一个个启动起来</a><a href="ch06.html">RolloutManager 如何组织生成</a><a href="ch07.html">一批数据如何到达训练 GPU</a><a href="ch08.html">读通 train.py 的一整个循环</a><a href="ch09.html">训练完，推理模型怎么拿到新权重</a><a href="ch10.html" aria-current="page">同卡部署、卸载与进程释放</a><a href="ch11.html">真正的异步发生在哪里</a><a href="ch12.html">卡住与失败时，沿边界排查</a><a href="ch13.html">亲手做一个 CPU 版迷你 slime</a><a href="glossary.html">术语与对象速查</a><a href="practice.html">理解题与源码寻路任务</a><a href="sources.html">版本、证据与源码索引</a></details></nav></aside>
+<main class="main"><p class="chapter-meta">分支与实战 / 第 10 章 · 约 20 分钟 · 已展开</p>
+<details class="mobile-nav"><summary>选择章节</summary><a href="ch00.html">先看一轮训练怎样发生</a><a href="ch01.html">第一次 remote：任务与结果引用</a><a href="ch02.html">Actor：让模型留在一个进程里</a><a href="ch03.html">等待、依赖与背压</a><a href="ch04.html">先安排座位：Placement Group</a><a href="ch05.html">把训练 worker 一个个启动起来</a><a href="ch06.html">RolloutManager 如何组织生成</a><a href="ch07.html">一批数据如何到达训练 GPU</a><a href="ch08.html">读通 train.py 的一整个循环</a><a href="ch09.html">训练完，推理模型怎么拿到新权重</a><a href="ch10.html" aria-current="page">同卡部署、卸载与进程释放</a><a href="ch11.html">真正的异步发生在哪里</a><a href="ch12.html">卡住与失败时，沿边界排查</a><a href="ch13.html">亲手做一个 CPU 版迷你 slime</a><a href="glossary.html">术语与对象速查</a><a href="practice.html">理解题与源码寻路任务</a><a href="sources.html">版本、证据与源码索引</a></details><div id="lab-banner"></div>
+<article id="content" class="prose"></article><noscript>请启用 JavaScript 阅读网页，或直接查看 content 中的 Markdown。</noscript>
+<section id="lab" class="lab" hidden><h2 class="lab-title"></h2><p class="lab-intro"></p><div id="lab-root"></div></section>
+<div class="study-actions"><button id="mark-read" type="button">标记为已读</button><span id="read-status" role="status"></span></div>
+<nav class="pager"><a class="prev" href="ch09.html"><span class="dir">← 上一章</span><div class="ttl">训练完，推理模型怎么拿到新权重</div></a><a class="next" href="ch11.html"><span class="dir">下一章 →</span><div class="ttl">真正的异步发生在哪里</div></a></nav><footer class="pagefoot">独立中文源码教程 · slime 5bae5bb7928d · 源码事实、教学简化与实验结果分别标注。<br>视觉样式参考 Ultra-Scale Playbook 中文版；署名见 <a href="sources.html">来源与许可</a>。</footer>
+</main></div><script type="text/markdown" id="chapter-md"># 同卡部署、卸载与进程释放
+
+> 阅读目标：分清“放在哪里”“显存里留什么”“进程还在不在”。状态：已展开。
+
+## 三个开关回答三个问题
+
+| 机制 | 回答的问题 | 可观察到的动作 |
+|---|---|---|
+| `colocate` | 训练和 rollout 是否使用重叠 GPU 布局？ | PG 数量与索引起点改变 |
+| `offload_train / offload_rollout` | 某阶段是否卸载 / 恢复部分设备内存状态？ | sleep / wake、release / resume memory |
+| `release_train` | rollout 阶段是否销毁训练 Ray Actors？ | `ray.kill`，随后重新 create 与加载 |
+
+这些不是同一个动作的三种叫法。开启某种资源布局也不等于已经实现显存切换；要沿入口和参数校验读完整组合。
+
+## 同卡时，PG 怎么算
+
+在 [_get_placement_group_layout](../source/slime/ray/placement_group.py.html#L100)的 colocate 分支，总数为 `max(actor_num_gpus, rollout_num_gpus)`，rollout offset 为 0。训练两卡、rollout 两卡时，逻辑布局从四卡变为两卡共用。
+
+资源主链：**布局改变 → 相同 PG 区域 → 训练和推理控制 Actor 使用分数 GPU 配额 → 后端显式处理设备与内存**。
+
+训练 Actor 通常申请 `0.4 GPU / 0.4 CPU`，SGLang 控制 Actor 申请 `0.2 GPU / 0.2 CPU`。在它们实际绑定的 bundle 上，这些数字参与调度记账。**0.4 GPU 不表示 Ray 给这个进程硬划了 40% 显存、40% SM 或固定算力。**实际服务可能使用多张卡，不能只把控制 Actor 的配额相加推导真实显存峰值。
+
+这是 CPU 实验无法验证的边界；GPU 显存是否足够要结合模型、KV cache、optimizer、通信 buffer 和峰值测量判断。
+
+## offload：对象还活着，内存状态暂时撤走
+
+1. [train.py](../source/train.py.html#L9)：生成之后可让 rollout offload；更新前先恢复推理权重所需状态，更新后再恢复 KV cache 等。
+2. [MegatronTrainRayActor.train](../source/slime/backends/megatron_utils/actor.py.html#L386)：`offload_train`时训练前 wake_up，训练后 sleep。
+3. [MegatronTrainRayActor.sleep](../source/slime/backends/megatron_utils/actor.py.html#L175)：配合 memory saver 释放设备占用，并处理进程组生命周期；对应 wake_up 恢复。
+4. [RolloutServer.onload_weights](../source/slime/backends/sglang_utils/engine_group.py.html#L316)与[onload_kv](../source/slime/backends/sglang_utils/engine_group.py.html#L325)：按阶段恢复权重、KV cache / CUDA graphs 等状态。
+
+设计上把权重恢复与 KV 恢复分开，可让权重更新发生在推理完整工作集重新就绪之前。具体节省多少显存、切换多久，本教程没有测量。
+
+注意 `clear_memory()`只是另一个清理接口，不应等同于杀进程、卸载模型或释放 PG。
+
+## release：需要保存，再销毁，再重建
+
+本版本的参数校验要求 `release_train`有保存路径、使用 `full + disk`权重更新，并且不支持 critic。见[校验位置](../source/slime/utils/arguments.py.html#L2083)。
+
+主链是：**训练 → 强制同步保存训练 checkpoint → 导出更新权重 → release 训练 Actors → 推理从磁盘加载权重 → rollout → 重新 create 训练 Actors → 恢复训练状态**。
+
+[RayTrainGroup.save_model](../source/slime/ray/actor_group.py.html#L151)在 release 路线更新恢复参数；[update_weights](../source/slime/ray/actor_group.py.html#L162)的 full disk 分支在导出后调用 release，再让 engines 重载；[release](../source/slime/ray/actor_group.py.html#L181)清空 handles 并 `ray.kill(..., no_restart=True)`。
+
+训练 checkpoint 与推理可加载的权重目录用途不同：前者用于恢复训练状态，后者让推理服务加载模型参数。不能认为“导出了推理权重”就一定保存了 optimizer / RNG 状态。
+
+销毁训练 Actor 也不等于删除 PG。PG 可能继续由作业持有，给重建或共用流程使用；Ray 的“可用资源”与进程显存占用是两个观察维度。
+
+## 选择分支时如何思考
+
+**设计理解**：分卡路线较容易隔离训练与推理的资源需求；同卡与 offload 减少同时驻留的要求，但增加切换管理；release 更彻底地移除训练进程，却带来保存、重建与重新加载成本。这是机制上的取舍，不是已测量的性能排名。
+
+选读 [RayTrainGroup._reload_rollout_weights_from_disk](../source/slime/ray/actor_group.py.html#L227)。暂缓磁盘 delta 编码、memory saver 底层分配器和不同 GPU 型号的兼容性验证。
+
+**理解题：看到训练 Actor 已被 kill，你能否断言它对应的 GPU 已归还给整个 Ray 集群？还要检查什么资源对象？**
+</script>
+<script src="../assets/marked.min.js"></script><script src="../assets/app.js"></script><script src="../assets/labs.js"></script></body></html>

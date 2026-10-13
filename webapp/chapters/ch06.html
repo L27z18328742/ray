@@ -1,0 +1,68 @@
+<!doctype html><html lang="zh-Hans"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="description" content="从 Ray 入门到读懂 slime/ray：基于固定源码的中文交互教程。">
+<title>RolloutManager 如何组织生成 · Ray 与 slime 源码导读</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="stylesheet" href="../assets/tutorial.css"></head><body data-chapter="ch06" data-lab="">
+<a class="skip" href="#content">跳到正文</a>
+<header class="topbar"><a class="brand" href="../index.html">Ray 与 slime<span>源码导读</span></a>
+<nav class="chapnav"><a href="../index.html">全部章节</a><a href="sources.html">版本与证据</a></nav></header>
+<div class="layout"><aside class="sidebar"><nav class="toc" id="toc"><h2>本章目录</h2><details class="book-nav"><summary>全书章节</summary><a href="ch00.html">先看一轮训练怎样发生</a><a href="ch01.html">第一次 remote：任务与结果引用</a><a href="ch02.html">Actor：让模型留在一个进程里</a><a href="ch03.html">等待、依赖与背压</a><a href="ch04.html">先安排座位：Placement Group</a><a href="ch05.html">把训练 worker 一个个启动起来</a><a href="ch06.html" aria-current="page">RolloutManager 如何组织生成</a><a href="ch07.html">一批数据如何到达训练 GPU</a><a href="ch08.html">读通 train.py 的一整个循环</a><a href="ch09.html">训练完，推理模型怎么拿到新权重</a><a href="ch10.html">同卡部署、卸载与进程释放</a><a href="ch11.html">真正的异步发生在哪里</a><a href="ch12.html">卡住与失败时，沿边界排查</a><a href="ch13.html">亲手做一个 CPU 版迷你 slime</a><a href="glossary.html">术语与对象速查</a><a href="practice.html">理解题与源码寻路任务</a><a href="sources.html">版本、证据与源码索引</a></details></nav></aside>
+<main class="main"><p class="chapter-meta">源码主线 / 第 6 章 · 约 25 分钟 · 已展开</p>
+<details class="mobile-nav"><summary>选择章节</summary><a href="ch00.html">先看一轮训练怎样发生</a><a href="ch01.html">第一次 remote：任务与结果引用</a><a href="ch02.html">Actor：让模型留在一个进程里</a><a href="ch03.html">等待、依赖与背压</a><a href="ch04.html">先安排座位：Placement Group</a><a href="ch05.html">把训练 worker 一个个启动起来</a><a href="ch06.html" aria-current="page">RolloutManager 如何组织生成</a><a href="ch07.html">一批数据如何到达训练 GPU</a><a href="ch08.html">读通 train.py 的一整个循环</a><a href="ch09.html">训练完，推理模型怎么拿到新权重</a><a href="ch10.html">同卡部署、卸载与进程释放</a><a href="ch11.html">真正的异步发生在哪里</a><a href="ch12.html">卡住与失败时，沿边界排查</a><a href="ch13.html">亲手做一个 CPU 版迷你 slime</a><a href="glossary.html">术语与对象速查</a><a href="practice.html">理解题与源码寻路任务</a><a href="sources.html">版本、证据与源码索引</a></details><div id="lab-banner"></div>
+<article id="content" class="prose"></article><noscript>请启用 JavaScript 阅读网页，或直接查看 content 中的 Markdown。</noscript>
+<section id="lab" class="lab" hidden><h2 class="lab-title"></h2><p class="lab-intro"></p><div id="lab-root"></div></section>
+<div class="study-actions"><button id="mark-read" type="button">标记为已读</button><span id="read-status" role="status"></span></div>
+<nav class="pager"><a class="prev" href="ch05.html"><span class="dir">← 上一章</span><div class="ttl">把训练 worker 一个个启动起来</div></a><a class="next" href="ch07.html"><span class="dir">下一章 →</span><div class="ttl">一批数据如何到达训练 GPU</div></a></nav><footer class="pagefoot">独立中文源码教程 · slime 5bae5bb7928d · 源码事实、教学简化与实验结果分别标注。<br>视觉样式参考 Ultra-Scale Playbook 中文版；署名见 <a href="sources.html">来源与许可</a>。</footer>
+</main></div><script type="text/markdown" id="chapter-md"># RolloutManager 如何组织生成
+
+> 阅读目标：从 driver 的一次 generate 调用，追到 SGLang 收到 HTTP 请求。状态：已展开。
+
+## manager 不是用 CPU 执行大模型推理
+
+[create_rollout_manager](../source/slime/ray/placement_group.py.html#L227)给 `RolloutManager` 设置 `num_cpus=1, num_gpus=0`。它负责读取数据、组织请求、等待结果和转换训练格式；GPU 推理由它管理的服务执行。
+
+manager handle 返回也不意味着服务已初始化。Actor 构造过程包含启动服务和等待初始化；后续需要构造完成的远程方法会受到这个顺序约束。若要从日志判断状态，应区分“handle 已拿到”与“引擎健康检查已通过”。
+
+## 启动服务：Ray 之外还有子进程
+
+主链：**RolloutManager.__init__ → start_rollout_servers → ServerGroup.start_engines → SGLangEngine.init → 服务子进程 → 健康检查与路由注册**。
+
+1. [RolloutManager.__init__](../source/slime/ray/rollout.py.html#L45)：输入配置和 rollout PG，调用服务部署函数，保存 pending init handles。
+2. [start_rollout_servers](../source/slime/backends/sglang_utils/deployment.py.html#L79)：解析模型 / server group 配置，启动 router，并逐组创建引擎，返回服务描述与初始化引用。
+3. [ServerGroup.start_engines](../source/slime/backends/sglang_utils/engine_group.py.html#L63)：按 PG 映射选择 base GPU，为 SGLangEngine 创建 Ray Actor、分配端口并提交 `init.remote()`。
+4. [SGLangEngine.init](../source/slime/backends/sglang_utils/sglang_engine.py.html#L105)与[launch_server_process](../source/slime/backends/sglang_utils/sglang_engine.py.html#L31)：配置服务参数并启动真正的 SGLang server 子进程。普通 node 0 路径会等待服务健康。
+5. manager 对初始化引用执行 `ray.get`，再建立锁与可选健康监控等状态。
+
+同节点的一个多 GPU 推理引擎可以由一个 Ray 控制 Actor 启动服务并管理多张 GPU。跨节点引擎又会有每节点控制实例。**训练的“一卡一个训练 rank”与推理的“一个 engine 几张卡”不能机械地一一对应。**
+
+`placement_group_capture_child_tasks=True`针对 Ray 子任务 / 子 Actor 的放置传播；它不是操作系统 `multiprocessing.Process` 的 GPU 隔离器。实际服务设备配置仍由 SGLang 启动参数决定。
+
+## 生成函数可以换，先确认默认绑定
+
+manager 通过 `load_function(args.rollout_function_path)`载入生成函数。不是看到 `generate_rollout` 这个成员名就能判断执行目标，必须继续找参数默认值。
+
+本版本[参数声明](../source/slime/utils/arguments.py.html#L339)默认绑定到 `slime.rollout.sglang_rollout.generate_rollout`，数据源默认是 `RolloutDataSourceWithBuffer`。因此同步主线可以确切追到下面的实现；如果用户配置覆盖了路径，应重新读取自定义函数。
+
+## 一批问题怎样变成 HTTP 请求
+
+主链：**driver generate.remote(id) → manager.generate → _get_rollout_data → call_rollout_fn → generate_rollout → generate_rollout_async → generate_and_rm_group → generate → HTTP /generate**。
+
+1. [RolloutManager._get_rollout_data](../source/slime/ray/rollout.py.html#L286)：调用已绑定函数，取得 samples 与 metrics，再展开嵌套样本。
+2. [generate_rollout](../source/slime/rollout/sglang_rollout.py.html#L668)：普通训练分支运行异步生成过程，必要时把中断样本放回数据 buffer。
+3. [generate_rollout_async](../source/slime/rollout/sglang_rollout.py.html#L415)：从数据源取 prompt groups，提交生成任务，用 `asyncio.wait(...FIRST_COMPLETED)`收集完成的组，达到目标后处理剩余请求。
+4. [generate_and_rm_group](../source/slime/rollout/sglang_rollout.py.html#L329)：组织同一 prompt 的多个 sample，以及生成 / reward 路径。
+5. [generate](../source/slime/rollout/sglang_rollout.py.html#L154)：准备 token、采样参数和 payload，向 router 的 `/generate` 发 HTTP 请求，再把 token 与 log probability 等结果写回 Sample。
+
+注意第三步是 **Python asyncio**，不是 `ray.wait`。manager 是同步 Ray Actor，不妨碍它在某次方法内部运行 asyncio 来并发等待许多 HTTP 请求。默认一个批次内部请求并发，也不等于这个批次与训练阶段重叠。
+
+## 生成完成后还没开始训练
+
+`RolloutFnTrainOutput`包含 samples 和 metrics；manager 后面还要记录信息、转换训练字段、按 DP 分片。driver 得到的是下一章解释的 `list[Box]`。
+
+选读 [call_rollout_fn](../source/slime/rollout/base_types.py.html#L19)，它还兼容旧格式输出。暂缓 external rollout、多模型 router、PD / EPD 分离；本章解释的是普通本地管理的 SGLang 部署。
+
+**理解题：`RolloutManager`没有申请 GPU，为什么它仍然能触发 GPU 上的生成？请分别画出 Ray 调用、普通 Python 调用和 HTTP 请求。**
+</script>
+<script src="../assets/marked.min.js"></script><script src="../assets/app.js"></script><script src="../assets/labs.js"></script></body></html>

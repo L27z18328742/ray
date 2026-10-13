@@ -1,0 +1,90 @@
+<!doctype html><html lang="zh-Hans"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="description" content="从 Ray 入门到读懂 slime/ray：基于固定源码的中文交互教程。">
+<title>真正的异步发生在哪里 · Ray 与 slime 源码导读</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="stylesheet" href="../assets/tutorial.css"></head><body data-chapter="ch11" data-lab="">
+<a class="skip" href="#content">跳到正文</a>
+<header class="topbar"><a class="brand" href="../index.html">Ray 与 slime<span>源码导读</span></a>
+<nav class="chapnav"><a href="../index.html">全部章节</a><a href="sources.html">版本与证据</a></nav></header>
+<div class="layout"><aside class="sidebar"><nav class="toc" id="toc"><h2>本章目录</h2><details class="book-nav"><summary>全书章节</summary><a href="ch00.html">先看一轮训练怎样发生</a><a href="ch01.html">第一次 remote：任务与结果引用</a><a href="ch02.html">Actor：让模型留在一个进程里</a><a href="ch03.html">等待、依赖与背压</a><a href="ch04.html">先安排座位：Placement Group</a><a href="ch05.html">把训练 worker 一个个启动起来</a><a href="ch06.html">RolloutManager 如何组织生成</a><a href="ch07.html">一批数据如何到达训练 GPU</a><a href="ch08.html">读通 train.py 的一整个循环</a><a href="ch09.html">训练完，推理模型怎么拿到新权重</a><a href="ch10.html">同卡部署、卸载与进程释放</a><a href="ch11.html" aria-current="page">真正的异步发生在哪里</a><a href="ch12.html">卡住与失败时，沿边界排查</a><a href="ch13.html">亲手做一个 CPU 版迷你 slime</a><a href="glossary.html">术语与对象速查</a><a href="practice.html">理解题与源码寻路任务</a><a href="sources.html">版本、证据与源码索引</a></details></nav></aside>
+<main class="main"><p class="chapter-meta">分支与实战 / 第 11 章 · 约 25 分钟 · 已展开</p>
+<details class="mobile-nav"><summary>选择章节</summary><a href="ch00.html">先看一轮训练怎样发生</a><a href="ch01.html">第一次 remote：任务与结果引用</a><a href="ch02.html">Actor：让模型留在一个进程里</a><a href="ch03.html">等待、依赖与背压</a><a href="ch04.html">先安排座位：Placement Group</a><a href="ch05.html">把训练 worker 一个个启动起来</a><a href="ch06.html">RolloutManager 如何组织生成</a><a href="ch07.html">一批数据如何到达训练 GPU</a><a href="ch08.html">读通 train.py 的一整个循环</a><a href="ch09.html">训练完，推理模型怎么拿到新权重</a><a href="ch10.html">同卡部署、卸载与进程释放</a><a href="ch11.html" aria-current="page">真正的异步发生在哪里</a><a href="ch12.html">卡住与失败时，沿边界排查</a><a href="ch13.html">亲手做一个 CPU 版迷你 slime</a><a href="glossary.html">术语与对象速查</a><a href="practice.html">理解题与源码寻路任务</a><a href="sources.html">版本、证据与源码索引</a></details><div id="lab-banner"></div>
+<article id="content" class="prose"></article><noscript>请启用 JavaScript 阅读网页，或直接查看 content 中的 Markdown。</noscript>
+<section id="lab" class="lab" hidden><h2 class="lab-title"></h2><p class="lab-intro"></p><div id="lab-root"></div></section>
+<div class="study-actions"><button id="mark-read" type="button">标记为已读</button><span id="read-status" role="status"></span></div>
+<nav class="pager"><a class="prev" href="ch10.html"><span class="dir">← 上一章</span><div class="ttl">同卡部署、卸载与进程释放</div></a><a class="next" href="ch12.html"><span class="dir">下一章 →</span><div class="ttl">卡住与失败时，沿边界排查</div></a></nav><footer class="pagefoot">独立中文源码教程 · slime 5bae5bb7928d · 源码事实、教学简化与实验结果分别标注。<br>视觉样式参考 Ultra-Scale Playbook 中文版；署名见 <a href="sources.html">来源与许可</a>。</footer>
+</main></div><script type="text/markdown" id="chapter-md"># 真正的异步发生在哪里
+
+> 阅读目标：解释为什么默认 train.py 是顺序驱动，而 fully-async rollout 仍能持续在后台生成。状态：已展开。
+
+## 不要寻找一个并不存在的入口
+
+在本教程固定的提交中，根目录没有 `train_async.py`。fully-async 示例仍使用 `train.py`，通过替换 rollout 函数启用后台持续生成。因此不能拿旧版本或其他框架的异步入口来解释当前实现。
+
+绑定位置是：
+
+```text
+--rollout-function-path
+slime.rollout.fully_async_rollout.generate_rollout_fully_async
+```
+
+本章属于进阶分支，前提是已经理解默认的“生成一批 → 训练一批 → 同步权重”。这里只做源码解释，没有运行完整异步 GPU 训练。
+
+## 前台还是一轮一轮，后台一直有工作
+
+主链：**manager 调用替换后的函数 → 获取进程级 worker → 后台线程运行 asyncio loop → 完成组进入队列 → 前台收够一批返回 → driver 开始训练 → 后台继续工作**。
+
+```text
+driver         get batch k ─── train k ─── update ─── get batch k+1
+manager 前台   [收集完成组]                            [收集完成组]
+后台线程       [生成任务池 → 完成队列 → 再补新任务 ……]
+推理服务                             更新窗口可能暂停 / 恢复
+```
+
+这是结构示意，非实测时间线。权重更新仍可能暂停生成；“fully async”不表示生成完全不受训练与同步影响，也不保证零等待。
+
+## 顺着线程与队列读
+
+1. [generate_rollout_fully_async](../source/slime/rollout/fully_async_rollout.py.html#L317)：作为 manager 绑定的公开入口，收集本轮数据；该版本明确拒绝 evaluation 模式。
+2. [_get_global_worker](../source/slime/rollout/fully_async_rollout.py.html#L59)：复用进程级 `_global_worker`；首次调用创建 `AsyncRolloutWorker`并启动线程。配置并发容量由 server concurrency 与 engine 数，再按 samples per prompt 折算为 group 并发。
+3. [AsyncRolloutWorker._thread_main](../source/slime/rollout/fully_async_rollout.py.html#L134)：在线程里运行 `asyncio.run(self._loop())`，与 manager 前台方法区分开。
+4. [_loop](../source/slime/rollout/fully_async_rollout.py.html#L137)：回收完成任务，在额度允许时从 data buffer 取新 prompt groups，调用 `generate_and_rm_group`，把结果放入队列。
+5. [_generate_rollout_async](../source/slime/rollout/fully_async_rollout.py.html#L221)：前台反复获取完成组，收够 rollout batch；按 sample index 排序，再交回 manager 的公共转换链路。
+
+这里使用的是 Python 线程、asyncio Task 和 `queue.Queue`，不是又创建了一组 Ray 训练 Actor。不同层的“任务”必须标明所在系统。
+
+## 队列没有 maxsize，为什么仍有背压
+
+源码给 output queue 使用无界 `queue.Queue()`，注释解释是避免 done callback 在事件循环线程里被阻塞的 put 卡住。它把背压放在补任务条件上：
+
+```python
+while (
+    len(active_tasks) < max_concurrent
+    and self.output_queue.qsize() < max_concurrent
+    and self.running
+):
+    # 从数据源取组，提交新生成
+    ...
+```
+
+也就是说：结果堆到一个池规模时停止补新工作，等训练侧取走结果再补。已在途的任务还可能继续完成，所以它不是“队列长度任何时刻绝不超过这个数”的严格断言，更不是字节级内存上限。
+
+这个观察也解释了为什么只检查 `Queue(maxsize=...)`不足以判断系统有没有背压：要找到生产者的补充条件和消费者的取数位置。
+
+## 异步之后，样本会变旧
+
+假设某组样本在策略 v3 时开始生成，训练已把推理侧推进到 v4；队列中可能仍有来自旧版本的样本。异步系统需要明确允许多旧的数据、如何记录版本、如何进行算法修正。
+
+本章只从源码确认队列跨 rollout 调用保留，以及 `rollout.py`在相应配置下查询权重版本用于度量。不要把“有版本字段”解释成“所有 staleness 都已自动消除”。想进一步研究要读 loss、off-policy 修正与测量路径，本教程不证明其训练收敛效果。
+
+## 退出与失败的边界
+
+全局 worker 通过 `atexit`注册停止函数；stop 设置 running 并 join 线程，源码带有等待上限。这不是异常退出或强杀进程时的持久化队列协议。某些 ABORTED 组会被重新放回 buffer，也不等于任意任务都自动恰好执行一次。
+
+选读[官方仓库的 fully-async 示例说明](../source/examples/fully_async/README.md.html#L1)。暂缓 rollout filter、复杂 agent 轨迹和异步算法效果；先确认并发发生在哪条线程及哪个边界。
+
+**理解题：如果 driver 仍在 `ray.get(actor.async_train(...))`等待训练，后台生成为什么还能继续？是哪一段状态没有随着上一轮 generate 返回而销毁？**
+</script>
+<script src="../assets/marked.min.js"></script><script src="../assets/app.js"></script><script src="../assets/labs.js"></script></body></html>

@@ -1,0 +1,441 @@
+<!doctype html><html lang="zh-Hans"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="description" content="从 Ray 入门到读懂 slime/ray：基于固定源码的中文交互教程。">
+<title>slime/backends/megatron_utils/update_weight/update_weight_from_tensor.py · Ray 与 slime 源码导读</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="../../../../../assets/style.css">
+<link rel="stylesheet" href="../../../../../assets/tutorial.css"></head><body class="source-page"><header class="topbar">
+<a class="brand" href="../../../../../index.html">Ray 与 slime</a><a href="https://github.com/THUDM/slime/blob/5bae5bb7928d65906e24e99f5b5d3f99a4daaf93/slime/backends/megatron_utils/update_weight/update_weight_from_tensor.py">GitHub 固定版本 ↗</a></header>
+<main class="source-wrap"><p><a href="../../../../../chapters/sources.html">← 源码索引</a> · 5bae5bb7928d · 只读快照</p>
+<h1>slime/backends/megatron_utils/update_weight/update_weight_from_tensor.py</h1><pre class="source-code"><code><span class="source-line" id="L1"><a href="#L1">   1</a> from argparse import Namespace</span>
+<span class="source-line" id="L2"><a href="#L2">   2</a> from collections import defaultdict</span>
+<span class="source-line" id="L3"><a href="#L3">   3</a> from collections.abc import Callable, Mapping, Sequence</span>
+<span class="source-line" id="L4"><a href="#L4">   4</a> from typing import Any</span>
+<span class="source-line" id="L5"><a href="#L5">   5</a> </span>
+<span class="source-line" id="L6"><a href="#L6">   6</a> import ray</span>
+<span class="source-line" id="L7"><a href="#L7">   7</a> import torch</span>
+<span class="source-line" id="L8"><a href="#L8">   8</a> import torch.distributed as dist</span>
+<span class="source-line" id="L9"><a href="#L9">   9</a> from megatron.core import mpu</span>
+<span class="source-line" id="L10"><a href="#L10">  10</a> from ray import ObjectRef</span>
+<span class="source-line" id="L11"><a href="#L11">  11</a> from ray.actor import ActorHandle</span>
+<span class="source-line" id="L12"><a href="#L12">  12</a> from tqdm import tqdm</span>
+<span class="source-line" id="L13"><a href="#L13">  13</a> </span>
+<span class="source-line" id="L14"><a href="#L14">  14</a> from slime.utils import accelerator</span>
+<span class="source-line" id="L15"><a href="#L15">  15</a> from slime.utils.distributed_utils import get_gloo_group</span>
+<span class="source-line" id="L16"><a href="#L16">  16</a> from slime.utils.types import ParamInfo</span>
+<span class="source-line" id="L17"><a href="#L17">  17</a> </span>
+<span class="source-line" id="L18"><a href="#L18">  18</a> from ..megatron_to_hf import convert_to_hf</span>
+<span class="source-line" id="L19"><a href="#L19">  19</a> from ..sglang import FlattenedTensorBucket, MultiprocessingSerializer</span>
+<span class="source-line" id="L20"><a href="#L20">  20</a> from .expert_routing import configure_expert_routing</span>
+<span class="source-line" id="L21"><a href="#L21">  21</a> from .hf_weight_iterator_direct import HfWeightIteratorDirect</span>
+<span class="source-line" id="L22"><a href="#L22">  22</a> from .update_weight_from_distributed import (</span>
+<span class="source-line" id="L23"><a href="#L23">  23</a>     connect_rollout_engines_from_distributed,</span>
+<span class="source-line" id="L24"><a href="#L24">  24</a>     disconnect_rollout_engines_from_distributed,</span>
+<span class="source-line" id="L25"><a href="#L25">  25</a>     post_process_weights,</span>
+<span class="source-line" id="L26"><a href="#L26">  26</a>     update_weights_from_distributed,</span>
+<span class="source-line" id="L27"><a href="#L27">  27</a> )</span>
+<span class="source-line" id="L28"><a href="#L28">  28</a> </span>
+<span class="source-line" id="L29"><a href="#L29">  29</a> </span>
+<span class="source-line" id="L30"><a href="#L30">  30</a> def _build_flattened_tensor_data(</span>
+<span class="source-line" id="L31"><a href="#L31">  31</a>     named_tensors: list[tuple[str, torch.Tensor]],</span>
+<span class="source-line" id="L32"><a href="#L32">  32</a> ) -&gt; dict[str, Any]:</span>
+<span class="source-line" id="L33"><a href="#L33">  33</a>     if not named_tensors:</span>
+<span class="source-line" id="L34"><a href="#L34">  34</a>         return {</span>
+<span class="source-line" id="L35"><a href="#L35">  35</a>             &quot;flattened_tensor&quot;: torch.empty(0, dtype=torch.uint8, device=accelerator.current_device()),</span>
+<span class="source-line" id="L36"><a href="#L36">  36</a>             &quot;metadata&quot;: [],</span>
+<span class="source-line" id="L37"><a href="#L37">  37</a>         }</span>
+<span class="source-line" id="L38"><a href="#L38">  38</a> </span>
+<span class="source-line" id="L39"><a href="#L39">  39</a>     # Do not reuse the IPC-facing flattened tensor. SGLang returns from the</span>
+<span class="source-line" id="L40"><a href="#L40">  40</a>     # HTTP/Ray request after enqueueing GPU copies into model weights, but it</span>
+<span class="source-line" id="L41"><a href="#L41">  41</a>     # does not guarantee a CUDA-device sync before the response. Reusing and</span>
+<span class="source-line" id="L42"><a href="#L42">  42</a>     # overwriting the same producer buffer immediately after ray.get can race</span>
+<span class="source-line" id="L43"><a href="#L43">  43</a>     # with the consumer-side copy and corrupt weights.</span>
+<span class="source-line" id="L44"><a href="#L44">  44</a>     flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)</span>
+<span class="source-line" id="L45"><a href="#L45">  45</a>     return {</span>
+<span class="source-line" id="L46"><a href="#L46">  46</a>         &quot;flattened_tensor&quot;: flattened_tensor_bucket.get_flattened_tensor(),</span>
+<span class="source-line" id="L47"><a href="#L47">  47</a>         &quot;metadata&quot;: flattened_tensor_bucket.get_metadata(),</span>
+<span class="source-line" id="L48"><a href="#L48">  48</a>     }</span>
+<span class="source-line" id="L49"><a href="#L49">  49</a> </span>
+<span class="source-line" id="L50"><a href="#L50">  50</a> </span>
+<span class="source-line" id="L51"><a href="#L51">  51</a> class UpdateWeightFromTensor:</span>
+<span class="source-line" id="L52"><a href="#L52">  52</a>     &quot;&quot;&quot;</span>
+<span class="source-line" id="L53"><a href="#L53">  53</a>     Update rollout engines from tensor dict:</span>
+<span class="source-line" id="L54"><a href="#L54">  54</a>     load(dict→GPU) → broadcast PP/EP(GPU NCCL) → gather TP(GPU NCCL) → convert HF(GPU) → send.</span>
+<span class="source-line" id="L55"><a href="#L55">  55</a>     Colocated: GPU→CPU serialize → gather_object(Gloo CPU, collects from rollout_num_gpus_per_engine ranks) → Ray IPC to engine.</span>
+<span class="source-line" id="L56"><a href="#L56">  56</a>     Distributed: GPU NCCL broadcast to remote engines.</span>
+<span class="source-line" id="L57"><a href="#L57">  57</a>     &quot;&quot;&quot;</span>
+<span class="source-line" id="L58"><a href="#L58">  58</a> </span>
+<span class="source-line" id="L59"><a href="#L59">  59</a>     def __init__(</span>
+<span class="source-line" id="L60"><a href="#L60">  60</a>         self,</span>
+<span class="source-line" id="L61"><a href="#L61">  61</a>         args: Namespace,</span>
+<span class="source-line" id="L62"><a href="#L62">  62</a>         model: Sequence[torch.nn.Module],</span>
+<span class="source-line" id="L63"><a href="#L63">  63</a>         weights_getter: Callable[[], Mapping[str, torch.Tensor]],</span>
+<span class="source-line" id="L64"><a href="#L64">  64</a>         *,</span>
+<span class="source-line" id="L65"><a href="#L65">  65</a>         model_name: str,</span>
+<span class="source-line" id="L66"><a href="#L66">  66</a>         quantization_config: dict[str, int | str | list[str]] | None,</span>
+<span class="source-line" id="L67"><a href="#L67">  67</a>     ) -&gt; None:</span>
+<span class="source-line" id="L68"><a href="#L68">  68</a>         &quot;&quot;&quot;</span>
+<span class="source-line" id="L69"><a href="#L69">  69</a>         Compute param buckets.  IPC Gloo groups are created later in</span>
+<span class="source-line" id="L70"><a href="#L70">  70</a>         ``connect_rollout_engines`` once ``engine_gpu_counts`` is known.</span>
+<span class="source-line" id="L71"><a href="#L71">  71</a>         &quot;&quot;&quot;</span>
+<span class="source-line" id="L72"><a href="#L72">  72</a>         self.args = args</span>
+<span class="source-line" id="L73"><a href="#L73">  73</a>         self.model = model</span>
+<span class="source-line" id="L74"><a href="#L74">  74</a>         self.weights_getter = weights_getter</span>
+<span class="source-line" id="L75"><a href="#L75">  75</a>         self.rank = dist.get_rank()</span>
+<span class="source-line" id="L76"><a href="#L76">  76</a>         self.model_name = model_name</span>
+<span class="source-line" id="L77"><a href="#L77">  77</a>         self.quantization_config = quantization_config</span>
+<span class="source-line" id="L78"><a href="#L78">  78</a>         self.weight_version = 0</span>
+<span class="source-line" id="L79"><a href="#L79">  79</a>         self.update_weight_metrics: dict[str, float] = {}</span>
+<span class="source-line" id="L80"><a href="#L80">  80</a> </span>
+<span class="source-line" id="L81"><a href="#L81">  81</a>         self._hf_weight_iterator = HfWeightIteratorDirect(</span>
+<span class="source-line" id="L82"><a href="#L82">  82</a>             args=args, model=model, model_name=model_name, quantization_config=quantization_config</span>
+<span class="source-line" id="L83"><a href="#L83">  83</a>         )</span>
+<span class="source-line" id="L84"><a href="#L84">  84</a>         param_info_buckets = getattr(self._hf_weight_iterator, &quot;megatron_local_param_info_buckets&quot;, None)</span>
+<span class="source-line" id="L85"><a href="#L85">  85</a>         self._full_param_info_buckets = (</span>
+<span class="source-line" id="L86"><a href="#L86">  86</a>             tuple(tuple(bucket) for bucket in param_info_buckets) if param_info_buckets is not None else None</span>
+<span class="source-line" id="L87"><a href="#L87">  87</a>         )</span>
+<span class="source-line" id="L88"><a href="#L88">  88</a>         self._non_expert_param_info_buckets: list[list[ParamInfo]] | None = None</span>
+<span class="source-line" id="L89"><a href="#L89">  89</a> </span>
+<span class="source-line" id="L90"><a href="#L90">  90</a>         self._ipc_gather_group = None</span>
+<span class="source-line" id="L91"><a href="#L91">  91</a>         self._ipc_gather_src = None</span>
+<span class="source-line" id="L92"><a href="#L92">  92</a>         self._ipc_engine = None</span>
+<span class="source-line" id="L93"><a href="#L93">  93</a>         self._model_update_groups = None</span>
+<span class="source-line" id="L94"><a href="#L94">  94</a>         self._expert_transfer_plan = []</span>
+<span class="source-line" id="L95"><a href="#L95">  95</a> </span>
+<span class="source-line" id="L96"><a href="#L96">  96</a>     def connect_rollout_engines(</span>
+<span class="source-line" id="L97"><a href="#L97">  97</a>         self,</span>
+<span class="source-line" id="L98"><a href="#L98">  98</a>         rollout_engines: Sequence[ActorHandle],</span>
+<span class="source-line" id="L99"><a href="#L99">  99</a>         rollout_engine_lock: ActorHandle,</span>
+<span class="source-line" id="L100"><a href="#L100"> 100</a>         engine_gpu_counts: Sequence[int] | None = None,</span>
+<span class="source-line" id="L101"><a href="#L101"> 101</a>         engine_gpu_offsets: Sequence[int] | None = None,</span>
+<span class="source-line" id="L102"><a href="#L102"> 102</a>         engine_parallel_configs: Sequence[Mapping[str, Any]] | None = None,</span>
+<span class="source-line" id="L103"><a href="#L103"> 103</a>     ) -&gt; None:</span>
+<span class="source-line" id="L104"><a href="#L104"> 104</a>         &quot;&quot;&quot;</span>
+<span class="source-line" id="L105"><a href="#L105"> 105</a>         Split colocated/distributed engines. Global source rank (DP=TP=PP=0) creates NCCL</span>
+<span class="source-line" id="L106"><a href="#L106"> 106</a>         for distributed. Map ranks to colocated IPC engines.</span>
+<span class="source-line" id="L107"><a href="#L107"> 107</a>         &quot;&quot;&quot;</span>
+<span class="source-line" id="L108"><a href="#L108"> 108</a>         self.rollout_engines = rollout_engines</span>
+<span class="source-line" id="L109"><a href="#L109"> 109</a> </span>
+<span class="source-line" id="L110"><a href="#L110"> 110</a>         if engine_gpu_counts is None:</span>
+<span class="source-line" id="L111"><a href="#L111"> 111</a>             engine_gpu_counts = [self.args.rollout_num_gpus_per_engine] * len(rollout_engines)</span>
+<span class="source-line" id="L112"><a href="#L112"> 112</a>         if engine_gpu_offsets is None:</span>
+<span class="source-line" id="L113"><a href="#L113"> 113</a>             # Fallback: assume engines are densely packed (no placeholder gaps).</span>
+<span class="source-line" id="L114"><a href="#L114"> 114</a>             engine_gpu_offsets = []</span>
+<span class="source-line" id="L115"><a href="#L115"> 115</a>             offset = 0</span>
+<span class="source-line" id="L116"><a href="#L116"> 116</a>             for c in engine_gpu_counts:</span>
+<span class="source-line" id="L117"><a href="#L117"> 117</a>                 engine_gpu_offsets.append(offset)</span>
+<span class="source-line" id="L118"><a href="#L118"> 118</a>                 offset += c</span>
+<span class="source-line" id="L119"><a href="#L119"> 119</a> </span>
+<span class="source-line" id="L120"><a href="#L120"> 120</a>         # Compute colocated engine count: engines whose GPUs fall within actor GPU range.</span>
+<span class="source-line" id="L121"><a href="#L121"> 121</a>         total_actor_gpus = self.args.actor_num_nodes * self.args.actor_num_gpus_per_node</span>
+<span class="source-line" id="L122"><a href="#L122"> 122</a>         colocate_engine_nums = 0</span>
+<span class="source-line" id="L123"><a href="#L123"> 123</a>         for gpu_offset, gpu_count in zip(engine_gpu_offsets, engine_gpu_counts, strict=True):</span>
+<span class="source-line" id="L124"><a href="#L124"> 124</a>             if gpu_offset + gpu_count &gt; total_actor_gpus:</span>
+<span class="source-line" id="L125"><a href="#L125"> 125</a>                 break</span>
+<span class="source-line" id="L126"><a href="#L126"> 126</a>             colocate_engine_nums += 1</span>
+<span class="source-line" id="L127"><a href="#L127"> 127</a> </span>
+<span class="source-line" id="L128"><a href="#L128"> 128</a>         self.use_distribute = len(rollout_engines) &gt; colocate_engine_nums</span>
+<span class="source-line" id="L129"><a href="#L129"> 129</a> </span>
+<span class="source-line" id="L130"><a href="#L130"> 130</a>         if self.use_distribute:</span>
+<span class="source-line" id="L131"><a href="#L131"> 131</a>             self.rollout_engines = rollout_engines[:colocate_engine_nums]</span>
+<span class="source-line" id="L132"><a href="#L132"> 132</a>             self.distributed_rollout_engines = rollout_engines[colocate_engine_nums:]</span>
+<span class="source-line" id="L133"><a href="#L133"> 133</a>             distributed_gpu_counts = engine_gpu_counts[colocate_engine_nums:]</span>
+<span class="source-line" id="L134"><a href="#L134"> 134</a>             self._is_distributed_src_rank = (</span>
+<span class="source-line" id="L135"><a href="#L135"> 135</a>                 mpu.get_data_parallel_rank(with_context_parallel=True) == 0</span>
+<span class="source-line" id="L136"><a href="#L136"> 136</a>                 and mpu.get_tensor_model_parallel_rank() == 0</span>
+<span class="source-line" id="L137"><a href="#L137"> 137</a>                 and mpu.get_pipeline_model_parallel_rank() == 0</span>
+<span class="source-line" id="L138"><a href="#L138"> 138</a>             )</span>
+<span class="source-line" id="L139"><a href="#L139"> 139</a>             self._group_name = &quot;slime&quot;</span>
+<span class="source-line" id="L140"><a href="#L140"> 140</a>             if self._is_distributed_src_rank:</span>
+<span class="source-line" id="L141"><a href="#L141"> 141</a>                 if self._model_update_groups is not None:</span>
+<span class="source-line" id="L142"><a href="#L142"> 142</a>                     disconnect_rollout_engines_from_distributed(</span>
+<span class="source-line" id="L143"><a href="#L143"> 143</a>                         self._group_name, self._model_update_groups, self.distributed_rollout_engines</span>
+<span class="source-line" id="L144"><a href="#L144"> 144</a>                     )</span>
+<span class="source-line" id="L145"><a href="#L145"> 145</a> </span>
+<span class="source-line" id="L146"><a href="#L146"> 146</a>                 self._model_update_groups = connect_rollout_engines_from_distributed(</span>
+<span class="source-line" id="L147"><a href="#L147"> 147</a>                     self.args,</span>
+<span class="source-line" id="L148"><a href="#L148"> 148</a>                     self._group_name,</span>
+<span class="source-line" id="L149"><a href="#L149"> 149</a>                     self.distributed_rollout_engines,</span>
+<span class="source-line" id="L150"><a href="#L150"> 150</a>                     engine_gpu_counts=distributed_gpu_counts,</span>
+<span class="source-line" id="L151"><a href="#L151"> 151</a>                 )</span>
+<span class="source-line" id="L152"><a href="#L152"> 152</a> </span>
+<span class="source-line" id="L153"><a href="#L153"> 153</a>         colocate_gpu_offsets = engine_gpu_offsets[:colocate_engine_nums]</span>
+<span class="source-line" id="L154"><a href="#L154"> 154</a>         colocate_gpu_counts = engine_gpu_counts[:colocate_engine_nums]</span>
+<span class="source-line" id="L155"><a href="#L155"> 155</a>         colocate_parallel_configs = (</span>
+<span class="source-line" id="L156"><a href="#L156"> 156</a>             engine_parallel_configs[:colocate_engine_nums] if engine_parallel_configs is not None else None</span>
+<span class="source-line" id="L157"><a href="#L157"> 157</a>         )</span>
+<span class="source-line" id="L158"><a href="#L158"> 158</a> </span>
+<span class="source-line" id="L159"><a href="#L159"> 159</a>         # Create IPC Gloo gather groups (only on first call; partitioning is</span>
+<span class="source-line" id="L160"><a href="#L160"> 160</a>         # fixed across reconnects).</span>
+<span class="source-line" id="L161"><a href="#L161"> 161</a>         if self._ipc_gather_group is None:</span>
+<span class="source-line" id="L162"><a href="#L162"> 162</a>             for i in range(colocate_engine_nums):</span>
+<span class="source-line" id="L163"><a href="#L163"> 163</a>                 group_ranks = list(range(colocate_gpu_offsets[i], colocate_gpu_offsets[i] + colocate_gpu_counts[i]))</span>
+<span class="source-line" id="L164"><a href="#L164"> 164</a>                 new_group = dist.new_group(ranks=group_ranks, backend=&quot;gloo&quot;)</span>
+<span class="source-line" id="L165"><a href="#L165"> 165</a>                 if self.rank in group_ranks:</span>
+<span class="source-line" id="L166"><a href="#L166"> 166</a>                     self._ipc_gather_group = new_group</span>
+<span class="source-line" id="L167"><a href="#L167"> 167</a>                     self._ipc_gather_src = colocate_gpu_offsets[i]</span>
+<span class="source-line" id="L168"><a href="#L168"> 168</a> </span>
+<span class="source-line" id="L169"><a href="#L169"> 169</a>         # Map training ranks to colocated engine actors.</span>
+<span class="source-line" id="L170"><a href="#L170"> 170</a>         for i, engine in enumerate(self.rollout_engines):</span>
+<span class="source-line" id="L171"><a href="#L171"> 171</a>             start = colocate_gpu_offsets[i]</span>
+<span class="source-line" id="L172"><a href="#L172"> 172</a>             end = start + colocate_gpu_counts[i]</span>
+<span class="source-line" id="L173"><a href="#L173"> 173</a>             if start &lt;= self.rank &lt; end:</span>
+<span class="source-line" id="L174"><a href="#L174"> 174</a>                 self._ipc_engine = engine</span>
+<span class="source-line" id="L175"><a href="#L175"> 175</a> </span>
+<span class="source-line" id="L176"><a href="#L176"> 176</a>         self._non_expert_param_info_buckets, self._expert_transfer_plan = configure_expert_routing(</span>
+<span class="source-line" id="L177"><a href="#L177"> 177</a>             args=self.args,</span>
+<span class="source-line" id="L178"><a href="#L178"> 178</a>             full_param_info_buckets=self._full_param_info_buckets,</span>
+<span class="source-line" id="L179"><a href="#L179"> 179</a>             get_local_weight_names=self.weights_getter,</span>
+<span class="source-line" id="L180"><a href="#L180"> 180</a>             engine_gpu_counts=colocate_gpu_counts,</span>
+<span class="source-line" id="L181"><a href="#L181"> 181</a>             engine_gpu_offsets=colocate_gpu_offsets,</span>
+<span class="source-line" id="L182"><a href="#L182"> 182</a>             engine_parallel_configs=colocate_parallel_configs,</span>
+<span class="source-line" id="L183"><a href="#L183"> 183</a>             use_distribute=self.use_distribute,</span>
+<span class="source-line" id="L184"><a href="#L184"> 184</a>         )</span>
+<span class="source-line" id="L185"><a href="#L185"> 185</a> </span>
+<span class="source-line" id="L186"><a href="#L186"> 186</a>     def pop_metrics(self) -&gt; dict[str, float]:</span>
+<span class="source-line" id="L187"><a href="#L187"> 187</a>         &quot;&quot;&quot;</span>
+<span class="source-line" id="L188"><a href="#L188"> 188</a>         Return and clear ``update_weight_metrics``. Empty under colocate today;</span>
+<span class="source-line" id="L189"><a href="#L189"> 189</a>         kept symmetric with UpdateWeightFromDistributed so the actor can drain unconditionally.</span>
+<span class="source-line" id="L190"><a href="#L190"> 190</a>         &quot;&quot;&quot;</span>
+<span class="source-line" id="L191"><a href="#L191"> 191</a>         out, self.update_weight_metrics = self.update_weight_metrics, {}</span>
+<span class="source-line" id="L192"><a href="#L192"> 192</a>         return out</span>
+<span class="source-line" id="L193"><a href="#L193"> 193</a> </span>
+<span class="source-line" id="L194"><a href="#L194"> 194</a>     def _prepare_expert_weight_batch(</span>
+<span class="source-line" id="L195"><a href="#L195"> 195</a>         self,</span>
+<span class="source-line" id="L196"><a href="#L196"> 196</a>         transfers: Sequence[Any],</span>
+<span class="source-line" id="L197"><a href="#L197"> 197</a>         megatron_local_weights: Mapping[str, torch.Tensor],</span>
+<span class="source-line" id="L198"><a href="#L198"> 198</a>         staging_buffers: dict[tuple[torch.dtype, tuple[int, ...]], list[torch.Tensor]],</span>
+<span class="source-line" id="L199"><a href="#L199"> 199</a>     ) -&gt; list[tuple[str, torch.Tensor]]:</span>
+<span class="source-line" id="L200"><a href="#L200"> 200</a>         local_params = []</span>
+<span class="source-line" id="L201"><a href="#L201"> 201</a>         p2p_ops = []</span>
+<span class="source-line" id="L202"><a href="#L202"> 202</a>         buffer_offsets: dict[tuple[torch.dtype, tuple[int, ...]], int] = defaultdict(int)</span>
+<span class="source-line" id="L203"><a href="#L203"> 203</a>         for transfer in transfers:</span>
+<span class="source-line" id="L204"><a href="#L204"> 204</a>             for expert_param in transfer.params:</span>
+<span class="source-line" id="L205"><a href="#L205"> 205</a>                 info = expert_param.info</span>
+<span class="source-line" id="L206"><a href="#L206"> 206</a>                 if self.rank != transfer.source_rank and self.rank not in transfer.target_ranks:</span>
+<span class="source-line" id="L207"><a href="#L207"> 207</a>                     continue</span>
+<span class="source-line" id="L208"><a href="#L208"> 208</a>                 key = (info.dtype, tuple(info.shape))</span>
+<span class="source-line" id="L209"><a href="#L209"> 209</a>                 pool = staging_buffers.setdefault(key, [])</span>
+<span class="source-line" id="L210"><a href="#L210"> 210</a>                 offset = buffer_offsets[key]</span>
+<span class="source-line" id="L211"><a href="#L211"> 211</a>                 buffer_offsets[key] = offset + 1</span>
+<span class="source-line" id="L212"><a href="#L212"> 212</a>                 if offset == len(pool):</span>
+<span class="source-line" id="L213"><a href="#L213"> 213</a>                     pool.append(torch.empty(info.shape, dtype=info.dtype, device=accelerator.device()))</span>
+<span class="source-line" id="L214"><a href="#L214"> 214</a>                 tensor = pool[offset]</span>
+<span class="source-line" id="L215"><a href="#L215"> 215</a>                 if self.rank == transfer.source_rank:</span>
+<span class="source-line" id="L216"><a href="#L216"> 216</a>                     source = megatron_local_weights[info.name]</span>
+<span class="source-line" id="L217"><a href="#L217"> 217</a>                     if source.shape != info.shape or source.dtype != info.dtype:</span>
+<span class="source-line" id="L218"><a href="#L218"> 218</a>                         raise ValueError(f&quot;expert metadata changed for {info.name}&quot;)</span>
+<span class="source-line" id="L219"><a href="#L219"> 219</a>                     tensor.copy_(source, non_blocking=True)</span>
+<span class="source-line" id="L220"><a href="#L220"> 220</a>                     p2p_ops.extend(</span>
+<span class="source-line" id="L221"><a href="#L221"> 221</a>                         dist.P2POp(dist.isend, tensor, target_rank)</span>
+<span class="source-line" id="L222"><a href="#L222"> 222</a>                         for target_rank in transfer.target_ranks</span>
+<span class="source-line" id="L223"><a href="#L223"> 223</a>                         if target_rank != self.rank</span>
+<span class="source-line" id="L224"><a href="#L224"> 224</a>                     )</span>
+<span class="source-line" id="L225"><a href="#L225"> 225</a>                     if self.rank in expert_param.target_ranks:</span>
+<span class="source-line" id="L226"><a href="#L226"> 226</a>                         local_params.append((expert_param, tensor))</span>
+<span class="source-line" id="L227"><a href="#L227"> 227</a>                 else:</span>
+<span class="source-line" id="L228"><a href="#L228"> 228</a>                     p2p_ops.append(dist.P2POp(dist.irecv, tensor, transfer.source_rank))</span>
+<span class="source-line" id="L229"><a href="#L229"> 229</a>                     local_params.append((expert_param, tensor))</span>
+<span class="source-line" id="L230"><a href="#L230"> 230</a> </span>
+<span class="source-line" id="L231"><a href="#L231"> 231</a>         for request in dist.batch_isend_irecv(p2p_ops) if p2p_ops else ():</span>
+<span class="source-line" id="L232"><a href="#L232"> 232</a>             request.wait()</span>
+<span class="source-line" id="L233"><a href="#L233"> 233</a> </span>
+<span class="source-line" id="L234"><a href="#L234"> 234</a>         hf_named_tensors = []</span>
+<span class="source-line" id="L235"><a href="#L235"> 235</a>         for expert_param, tensor in local_params:</span>
+<span class="source-line" id="L236"><a href="#L236"> 236</a>             hf_named_tensors.extend(</span>
+<span class="source-line" id="L237"><a href="#L237"> 237</a>                 convert_to_hf(</span>
+<span class="source-line" id="L238"><a href="#L238"> 238</a>                     self.args,</span>
+<span class="source-line" id="L239"><a href="#L239"> 239</a>                     self.model_name,</span>
+<span class="source-line" id="L240"><a href="#L240"> 240</a>                     expert_param.info.name,</span>
+<span class="source-line" id="L241"><a href="#L241"> 241</a>                     tensor,</span>
+<span class="source-line" id="L242"><a href="#L242"> 242</a>                     self.quantization_config,</span>
+<span class="source-line" id="L243"><a href="#L243"> 243</a>                 )</span>
+<span class="source-line" id="L244"><a href="#L244"> 244</a>             )</span>
+<span class="source-line" id="L245"><a href="#L245"> 245</a>         return hf_named_tensors</span>
+<span class="source-line" id="L246"><a href="#L246"> 246</a> </span>
+<span class="source-line" id="L247"><a href="#L247"> 247</a>     def _update_expert_weights(</span>
+<span class="source-line" id="L248"><a href="#L248"> 248</a>         self,</span>
+<span class="source-line" id="L249"><a href="#L249"> 249</a>         megatron_local_weights: Mapping[str, torch.Tensor],</span>
+<span class="source-line" id="L250"><a href="#L250"> 250</a>     ) -&gt; None:</span>
+<span class="source-line" id="L251"><a href="#L251"> 251</a>         dist.barrier(group=get_gloo_group())</span>
+<span class="source-line" id="L252"><a href="#L252"> 252</a>         # Initialize WORLD on all ranks before subset batched P2P.</span>
+<span class="source-line" id="L253"><a href="#L253"> 253</a>         dist.barrier()</span>
+<span class="source-line" id="L254"><a href="#L254"> 254</a>         # Reuse staging across layers instead of fragmenting the CUDA allocator.</span>
+<span class="source-line" id="L255"><a href="#L255"> 255</a>         staging_buffers: dict[tuple[torch.dtype, tuple[int, ...]], list[torch.Tensor]] = {}</span>
+<span class="source-line" id="L256"><a href="#L256"> 256</a>         for transfer_group in tqdm(</span>
+<span class="source-line" id="L257"><a href="#L257"> 257</a>             self._expert_transfer_plan,</span>
+<span class="source-line" id="L258"><a href="#L258"> 258</a>             disable=self.rank != 0,</span>
+<span class="source-line" id="L259"><a href="#L259"> 259</a>             desc=&quot;Update expert weights&quot;,</span>
+<span class="source-line" id="L260"><a href="#L260"> 260</a>         ):</span>
+<span class="source-line" id="L261"><a href="#L261"> 261</a>             for transfer_batch in transfer_group:</span>
+<span class="source-line" id="L262"><a href="#L262"> 262</a>                 hf_named_tensors = self._prepare_expert_weight_batch(</span>
+<span class="source-line" id="L263"><a href="#L263"> 263</a>                     transfer_batch,</span>
+<span class="source-line" id="L264"><a href="#L264"> 264</a>                     megatron_local_weights,</span>
+<span class="source-line" id="L265"><a href="#L265"> 265</a>                     staging_buffers,</span>
+<span class="source-line" id="L266"><a href="#L266"> 266</a>                 )</span>
+<span class="source-line" id="L267"><a href="#L267"> 267</a>                 refs, long_lived_tensors = self._send_hf_params(hf_named_tensors)</span>
+<span class="source-line" id="L268"><a href="#L268"> 268</a>                 ray.get(refs)</span>
+<span class="source-line" id="L269"><a href="#L269"> 269</a>                 dist.barrier(group=get_gloo_group())</span>
+<span class="source-line" id="L270"><a href="#L270"> 270</a>                 accelerator.synchronize()</span>
+<span class="source-line" id="L271"><a href="#L271"> 271</a>                 del refs, long_lived_tensors, hf_named_tensors</span>
+<span class="source-line" id="L272"><a href="#L272"> 272</a>                 accelerator.ipc_collect()</span>
+<span class="source-line" id="L273"><a href="#L273"> 273</a>                 accelerator.empty_cache()</span>
+<span class="source-line" id="L274"><a href="#L274"> 274</a>         del staging_buffers</span>
+<span class="source-line" id="L275"><a href="#L275"> 275</a>         accelerator.empty_cache()</span>
+<span class="source-line" id="L276"><a href="#L276"> 276</a> </span>
+<span class="source-line" id="L277"><a href="#L277"> 277</a>     @torch.no_grad()</span>
+<span class="source-line" id="L278"><a href="#L278"> 278</a>     def update_weights(self) -&gt; None:</span>
+<span class="source-line" id="L279"><a href="#L279"> 279</a>         &quot;&quot;&quot;</span>
+<span class="source-line" id="L280"><a href="#L280"> 280</a>         version++, flush caches, process buckets. Progress on rank 0.</span>
+<span class="source-line" id="L281"><a href="#L281"> 281</a>         &quot;&quot;&quot;</span>
+<span class="source-line" id="L282"><a href="#L282"> 282</a>         self.weight_version += 1</span>
+<span class="source-line" id="L283"><a href="#L283"> 283</a> </span>
+<span class="source-line" id="L284"><a href="#L284"> 284</a>         if self.rank == 0:</span>
+<span class="source-line" id="L285"><a href="#L285"> 285</a>             ray.get([engine.pause_generation.remote() for engine in self.rollout_engines])</span>
+<span class="source-line" id="L286"><a href="#L286"> 286</a>             ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])</span>
+<span class="source-line" id="L287"><a href="#L287"> 287</a>             if self.quantization_config and self.quantization_config[&quot;quant_method&quot;] in [&quot;compressed-tensors&quot;]:</span>
+<span class="source-line" id="L288"><a href="#L288"> 288</a>                 post_process_weights(</span>
+<span class="source-line" id="L289"><a href="#L289"> 289</a>                     restore_weights_before_load=True,</span>
+<span class="source-line" id="L290"><a href="#L290"> 290</a>                     post_process_quantization=False,</span>
+<span class="source-line" id="L291"><a href="#L291"> 291</a>                     rollout_engines=self.rollout_engines,</span>
+<span class="source-line" id="L292"><a href="#L292"> 292</a>                 )</span>
+<span class="source-line" id="L293"><a href="#L293"> 293</a>         dist.barrier(group=get_gloo_group())</span>
+<span class="source-line" id="L294"><a href="#L294"> 294</a> </span>
+<span class="source-line" id="L295"><a href="#L295"> 295</a>         megatron_local_weights = self.weights_getter()</span>
+<span class="source-line" id="L296"><a href="#L296"> 296</a> </span>
+<span class="source-line" id="L297"><a href="#L297"> 297</a>         param_info_buckets = (</span>
+<span class="source-line" id="L298"><a href="#L298"> 298</a>             self._non_expert_param_info_buckets if self._expert_transfer_plan else self._full_param_info_buckets</span>
+<span class="source-line" id="L299"><a href="#L299"> 299</a>         )</span>
+<span class="source-line" id="L300"><a href="#L300"> 300</a>         for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(</span>
+<span class="source-line" id="L301"><a href="#L301"> 301</a>             megatron_local_weights,</span>
+<span class="source-line" id="L302"><a href="#L302"> 302</a>             param_info_buckets=param_info_buckets,</span>
+<span class="source-line" id="L303"><a href="#L303"> 303</a>         ):</span>
+<span class="source-line" id="L304"><a href="#L304"> 304</a>             refs, long_lived_tensors = self._send_hf_params(hf_named_tensors)</span>
+<span class="source-line" id="L305"><a href="#L305"> 305</a>             ray.get(refs)</span>
+<span class="source-line" id="L306"><a href="#L306"> 306</a>             # Free GPU tensors so the caching allocator can reuse the blocks,</span>
+<span class="source-line" id="L307"><a href="#L307"> 307</a>             # then release CUDA IPC cache entries whose consumers (sglang engines)</span>
+<span class="source-line" id="L308"><a href="#L308"> 308</a>             # have already closed their IPC handles.</span>
+<span class="source-line" id="L309"><a href="#L309"> 309</a>             del refs, long_lived_tensors, hf_named_tensors</span>
+<span class="source-line" id="L310"><a href="#L310"> 310</a>             accelerator.ipc_collect()</span>
+<span class="source-line" id="L311"><a href="#L311"> 311</a>             accelerator.empty_cache()</span>
+<span class="source-line" id="L312"><a href="#L312"> 312</a> </span>
+<span class="source-line" id="L313"><a href="#L313"> 313</a>         if self._expert_transfer_plan:</span>
+<span class="source-line" id="L314"><a href="#L314"> 314</a>             self._update_expert_weights(megatron_local_weights)</span>
+<span class="source-line" id="L315"><a href="#L315"> 315</a> </span>
+<span class="source-line" id="L316"><a href="#L316"> 316</a>         del megatron_local_weights</span>
+<span class="source-line" id="L317"><a href="#L317"> 317</a>         dist.barrier(group=get_gloo_group())</span>
+<span class="source-line" id="L318"><a href="#L318"> 318</a>         # After the barrier all engines have returned, so every rank&#x27;s last-chunk</span>
+<span class="source-line" id="L319"><a href="#L319"> 319</a>         # IPC handles are now released by the consumers.  Clean them up.</span>
+<span class="source-line" id="L320"><a href="#L320"> 320</a>         accelerator.ipc_collect()</span>
+<span class="source-line" id="L321"><a href="#L321"> 321</a>         accelerator.empty_cache()</span>
+<span class="source-line" id="L322"><a href="#L322"> 322</a> </span>
+<span class="source-line" id="L323"><a href="#L323"> 323</a>         # int4/fp4 post_process</span>
+<span class="source-line" id="L324"><a href="#L324"> 324</a>         if self.rank == 0:</span>
+<span class="source-line" id="L325"><a href="#L325"> 325</a>             if self.quantization_config and self.quantization_config[&quot;quant_method&quot;] in [&quot;compressed-tensors&quot;]:</span>
+<span class="source-line" id="L326"><a href="#L326"> 326</a>                 post_process_weights(</span>
+<span class="source-line" id="L327"><a href="#L327"> 327</a>                     restore_weights_before_load=False,</span>
+<span class="source-line" id="L328"><a href="#L328"> 328</a>                     post_process_quantization=True,</span>
+<span class="source-line" id="L329"><a href="#L329"> 329</a>                     rollout_engines=self.rollout_engines,</span>
+<span class="source-line" id="L330"><a href="#L330"> 330</a>                 )</span>
+<span class="source-line" id="L331"><a href="#L331"> 331</a>             ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])</span>
+<span class="source-line" id="L332"><a href="#L332"> 332</a>         dist.barrier(group=get_gloo_group())</span>
+<span class="source-line" id="L333"><a href="#L333"> 333</a> </span>
+<span class="source-line" id="L334"><a href="#L334"> 334</a>     def _send_hf_params(self, hf_named_tensors) -&gt; tuple[list[ObjectRef], Any]:</span>
+<span class="source-line" id="L335"><a href="#L335"> 335</a>         all_refs = []</span>
+<span class="source-line" id="L336"><a href="#L336"> 336</a> </span>
+<span class="source-line" id="L337"><a href="#L337"> 337</a>         refs_colocated, long_lived_tensors = _send_to_colocated_engine(</span>
+<span class="source-line" id="L338"><a href="#L338"> 338</a>             hf_named_tensors,</span>
+<span class="source-line" id="L339"><a href="#L339"> 339</a>             ipc_engine=self._ipc_engine,</span>
+<span class="source-line" id="L340"><a href="#L340"> 340</a>             ipc_gather_src=self._ipc_gather_src,</span>
+<span class="source-line" id="L341"><a href="#L341"> 341</a>             ipc_gather_group=self._ipc_gather_group,</span>
+<span class="source-line" id="L342"><a href="#L342"> 342</a>             weight_version=self.weight_version,</span>
+<span class="source-line" id="L343"><a href="#L343"> 343</a>         )</span>
+<span class="source-line" id="L344"><a href="#L344"> 344</a>         all_refs.extend(refs_colocated)</span>
+<span class="source-line" id="L345"><a href="#L345"> 345</a> </span>
+<span class="source-line" id="L346"><a href="#L346"> 346</a>         if self.use_distribute and self._is_distributed_src_rank:</span>
+<span class="source-line" id="L347"><a href="#L347"> 347</a>             refs_distributed = update_weights_from_distributed(</span>
+<span class="source-line" id="L348"><a href="#L348"> 348</a>                 self._group_name,</span>
+<span class="source-line" id="L349"><a href="#L349"> 349</a>                 self._model_update_groups,</span>
+<span class="source-line" id="L350"><a href="#L350"> 350</a>                 self.weight_version,</span>
+<span class="source-line" id="L351"><a href="#L351"> 351</a>                 self.distributed_rollout_engines,</span>
+<span class="source-line" id="L352"><a href="#L352"> 352</a>                 hf_named_tensors,</span>
+<span class="source-line" id="L353"><a href="#L353"> 353</a>             )</span>
+<span class="source-line" id="L354"><a href="#L354"> 354</a>             if refs_distributed:</span>
+<span class="source-line" id="L355"><a href="#L355"> 355</a>                 all_refs.extend(refs_distributed)</span>
+<span class="source-line" id="L356"><a href="#L356"> 356</a> </span>
+<span class="source-line" id="L357"><a href="#L357"> 357</a>         return all_refs, long_lived_tensors</span>
+<span class="source-line" id="L358"><a href="#L358"> 358</a> </span>
+<span class="source-line" id="L359"><a href="#L359"> 359</a> </span>
+<span class="source-line" id="L360"><a href="#L360"> 360</a> def _send_to_colocated_engine(</span>
+<span class="source-line" id="L361"><a href="#L361"> 361</a>     hf_named_tensors: list[tuple[str, torch.Tensor]],</span>
+<span class="source-line" id="L362"><a href="#L362"> 362</a>     *,</span>
+<span class="source-line" id="L363"><a href="#L363"> 363</a>     ipc_engine,</span>
+<span class="source-line" id="L364"><a href="#L364"> 364</a>     ipc_gather_src,</span>
+<span class="source-line" id="L365"><a href="#L365"> 365</a>     ipc_gather_group,</span>
+<span class="source-line" id="L366"><a href="#L366"> 366</a>     weight_version,</span>
+<span class="source-line" id="L367"><a href="#L367"> 367</a> ) -&gt; tuple[list[ObjectRef], Any]:</span>
+<span class="source-line" id="L368"><a href="#L368"> 368</a>     # Placeholder ranks (GPU slots reserved but no engine) have no gather group.</span>
+<span class="source-line" id="L369"><a href="#L369"> 369</a>     # gather_object is only collective among group members, so we skip entirely.</span>
+<span class="source-line" id="L370"><a href="#L370"> 370</a>     if ipc_gather_group is None:</span>
+<span class="source-line" id="L371"><a href="#L371"> 371</a>         return [], None</span>
+<span class="source-line" id="L372"><a href="#L372"> 372</a> </span>
+<span class="source-line" id="L373"><a href="#L373"> 373</a>     long_live_tensors = []</span>
+<span class="source-line" id="L374"><a href="#L374"> 374</a> </span>
+<span class="source-line" id="L375"><a href="#L375"> 375</a>     if getattr(FlattenedTensorBucket, &quot;supports_multi_dtypes&quot;, False):</span>
+<span class="source-line" id="L376"><a href="#L376"> 376</a>         converted_named_tensors_by_dtypes = {&quot;dtype&quot;: hf_named_tensors} if hf_named_tensors else {}</span>
+<span class="source-line" id="L377"><a href="#L377"> 377</a>     else:</span>
+<span class="source-line" id="L378"><a href="#L378"> 378</a>         converted_named_tensors_by_dtypes = {}</span>
+<span class="source-line" id="L379"><a href="#L379"> 379</a>         for name, tensor in hf_named_tensors:</span>
+<span class="source-line" id="L380"><a href="#L380"> 380</a>             dtype = tensor.dtype</span>
+<span class="source-line" id="L381"><a href="#L381"> 381</a>             if dtype not in converted_named_tensors_by_dtypes:</span>
+<span class="source-line" id="L382"><a href="#L382"> 382</a>                 converted_named_tensors_by_dtypes[dtype] = []</span>
+<span class="source-line" id="L383"><a href="#L383"> 383</a>             converted_named_tensors_by_dtypes[dtype].append((name, tensor))</span>
+<span class="source-line" id="L384"><a href="#L384"> 384</a> </span>
+<span class="source-line" id="L385"><a href="#L385"> 385</a>     serialized_tensors = []</span>
+<span class="source-line" id="L386"><a href="#L386"> 386</a>     for _dtype, named_tensors in converted_named_tensors_by_dtypes.items():</span>
+<span class="source-line" id="L387"><a href="#L387"> 387</a>         flattened_tensor_data = _build_flattened_tensor_data(named_tensors)</span>
+<span class="source-line" id="L388"><a href="#L388"> 388</a>         long_live_tensors.append(flattened_tensor_data)</span>
+<span class="source-line" id="L389"><a href="#L389"> 389</a>         serialized_tensors.append(MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True))</span>
+<span class="source-line" id="L390"><a href="#L390"> 390</a> </span>
+<span class="source-line" id="L391"><a href="#L391"> 391</a>     serialized_named_tensors = (</span>
+<span class="source-line" id="L392"><a href="#L392"> 392</a>         [None] * dist.get_world_size(ipc_gather_group) if ipc_gather_src == dist.get_rank() else None</span>
+<span class="source-line" id="L393"><a href="#L393"> 393</a>     )</span>
+<span class="source-line" id="L394"><a href="#L394"> 394</a>     dist.gather_object(</span>
+<span class="source-line" id="L395"><a href="#L395"> 395</a>         serialized_tensors,</span>
+<span class="source-line" id="L396"><a href="#L396"> 396</a>         object_gather_list=serialized_named_tensors,</span>
+<span class="source-line" id="L397"><a href="#L397"> 397</a>         dst=ipc_gather_src,</span>
+<span class="source-line" id="L398"><a href="#L398"> 398</a>         group=ipc_gather_group,</span>
+<span class="source-line" id="L399"><a href="#L399"> 399</a>     )</span>
+<span class="source-line" id="L400"><a href="#L400"> 400</a> </span>
+<span class="source-line" id="L401"><a href="#L401"> 401</a>     refs = []</span>
+<span class="source-line" id="L402"><a href="#L402"> 402</a>     if dist.get_rank() == ipc_gather_src:</span>
+<span class="source-line" id="L403"><a href="#L403"> 403</a>         num_buckets = max(len(tensors) for tensors in serialized_named_tensors)</span>
+<span class="source-line" id="L404"><a href="#L404"> 404</a>         empty_serialized_tensor = None</span>
+<span class="source-line" id="L405"><a href="#L405"> 405</a>         for i in range(num_buckets):</span>
+<span class="source-line" id="L406"><a href="#L406"> 406</a>             serialized_tensors_for_dtype = []</span>
+<span class="source-line" id="L407"><a href="#L407"> 407</a>             for tensors in serialized_named_tensors:</span>
+<span class="source-line" id="L408"><a href="#L408"> 408</a>                 if i &lt; len(tensors):</span>
+<span class="source-line" id="L409"><a href="#L409"> 409</a>                     serialized_tensors_for_dtype.append(tensors[i])</span>
+<span class="source-line" id="L410"><a href="#L410"> 410</a>                     continue</span>
+<span class="source-line" id="L411"><a href="#L411"> 411</a> </span>
+<span class="source-line" id="L412"><a href="#L412"> 412</a>                 if empty_serialized_tensor is None:</span>
+<span class="source-line" id="L413"><a href="#L413"> 413</a>                     empty_tensor_data = _empty_flattened_tensor_data()</span>
+<span class="source-line" id="L414"><a href="#L414"> 414</a>                     long_live_tensors.append(empty_tensor_data)</span>
+<span class="source-line" id="L415"><a href="#L415"> 415</a>                     empty_serialized_tensor = MultiprocessingSerializer.serialize(empty_tensor_data, output_str=True)</span>
+<span class="source-line" id="L416"><a href="#L416"> 416</a>                 serialized_tensors_for_dtype.append(empty_serialized_tensor)</span>
+<span class="source-line" id="L417"><a href="#L417"> 417</a> </span>
+<span class="source-line" id="L418"><a href="#L418"> 418</a>             kwargs = {</span>
+<span class="source-line" id="L419"><a href="#L419"> 419</a>                 &quot;serialized_named_tensors&quot;: serialized_tensors_for_dtype,</span>
+<span class="source-line" id="L420"><a href="#L420"> 420</a>                 &quot;load_format&quot;: &quot;flattened_bucket&quot;,</span>
+<span class="source-line" id="L421"><a href="#L421"> 421</a>                 &quot;weight_version&quot;: str(weight_version),</span>
+<span class="source-line" id="L422"><a href="#L422"> 422</a>             }</span>
+<span class="source-line" id="L423"><a href="#L423"> 423</a>             refs.append(ipc_engine.update_weights_from_tensor.remote(**kwargs))</span>
+<span class="source-line" id="L424"><a href="#L424"> 424</a> </span>
+<span class="source-line" id="L425"><a href="#L425"> 425</a>     return refs, long_live_tensors</span>
+<span class="source-line" id="L426"><a href="#L426"> 426</a> </span>
+<span class="source-line" id="L427"><a href="#L427"> 427</a> </span>
+<span class="source-line" id="L428"><a href="#L428"> 428</a> def _empty_flattened_tensor_data():</span>
+<span class="source-line" id="L429"><a href="#L429"> 429</a>     return {</span>
+<span class="source-line" id="L430"><a href="#L430"> 430</a>         &quot;flattened_tensor&quot;: torch.empty(0, dtype=torch.uint8, device=accelerator.current_device()),</span>
+<span class="source-line" id="L431"><a href="#L431"> 431</a>         &quot;metadata&quot;: [],</span>
+<span class="source-line" id="L432"><a href="#L432"> 432</a>     }</span></code></pre></main></body></html>

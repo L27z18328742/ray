@@ -1,0 +1,3 @@
+2026-09-20 17:28:35,743	INFO worker.py:1951 -- Started a local Ray instance.
+driver: 1927 type: ObjectRef
+PASS tasks: [{'value': 4, 'worker_pid': 2127}, {'value': 9, 'worker_pid': 2126}]

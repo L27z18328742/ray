@@ -1,0 +1,589 @@
+<!doctype html><html lang="zh-Hans"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="description" content="从 Ray 入门到读懂 slime/ray：基于固定源码的中文交互教程。">
+<title>slime/ray/rollout.py · Ray 与 slime 源码导读</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="../../../assets/style.css">
+<link rel="stylesheet" href="../../../assets/tutorial.css"></head><body class="source-page"><header class="topbar">
+<a class="brand" href="../../../index.html">Ray 与 slime</a><a href="https://github.com/THUDM/slime/blob/5bae5bb7928d65906e24e99f5b5d3f99a4daaf93/slime/ray/rollout.py">GitHub 固定版本 ↗</a></header>
+<main class="source-wrap"><p><a href="../../../chapters/sources.html">← 源码索引</a> · 5bae5bb7928d · 只读快照</p>
+<h1>slime/ray/rollout.py</h1><pre class="source-code"><code><span class="source-line" id="L1"><a href="#L1">   1</a> import itertools</span>
+<span class="source-line" id="L2"><a href="#L2">   2</a> import logging</span>
+<span class="source-line" id="L3"><a href="#L3">   3</a> import time</span>
+<span class="source-line" id="L4"><a href="#L4">   4</a> from typing import Any</span>
+<span class="source-line" id="L5"><a href="#L5">   5</a> </span>
+<span class="source-line" id="L6"><a href="#L6">   6</a> import psutil</span>
+<span class="source-line" id="L7"><a href="#L7">   7</a> import ray</span>
+<span class="source-line" id="L8"><a href="#L8">   8</a> import torch</span>
+<span class="source-line" id="L9"><a href="#L9">   9</a> </span>
+<span class="source-line" id="L10"><a href="#L10">  10</a> from slime.backends.sglang_utils.deployment import start_rollout_servers</span>
+<span class="source-line" id="L11"><a href="#L11">  11</a> from slime.observability import logging_utils</span>
+<span class="source-line" id="L12"><a href="#L12">  12</a> from slime.observability.logging_utils import configure_logger, init_tracking</span>
+<span class="source-line" id="L13"><a href="#L13">  13</a> from slime.observability.rollout_data_utils import (</span>
+<span class="source-line" id="L14"><a href="#L14">  14</a>     load_debug_rollout_data,</span>
+<span class="source-line" id="L15"><a href="#L15">  15</a>     save_debug_rollout_data,</span>
+<span class="source-line" id="L16"><a href="#L16">  16</a>     tensorize_rollout_data_for_training,</span>
+<span class="source-line" id="L17"><a href="#L17">  17</a>     validate_rollout_id_annotated,</span>
+<span class="source-line" id="L18"><a href="#L18">  18</a>     validate_rollout_routed_experts_for_replay,</span>
+<span class="source-line" id="L19"><a href="#L19">  19</a> )</span>
+<span class="source-line" id="L20"><a href="#L20">  20</a> from slime.observability.rollout_metrics import log_eval_rollout_data, log_rollout_data</span>
+<span class="source-line" id="L21"><a href="#L21">  21</a> from slime.rollout.base_types import call_rollout_fn</span>
+<span class="source-line" id="L22"><a href="#L22">  22</a> from slime.rollout.sample_hooks import set_current_rollout_id</span>
+<span class="source-line" id="L23"><a href="#L23">  23</a> from slime.utils.data import get_source</span>
+<span class="source-line" id="L24"><a href="#L24">  24</a> from slime.utils.dp_schedule import build_dp_schedule</span>
+<span class="source-line" id="L25"><a href="#L25">  25</a> from slime.utils.health_monitor import RolloutHealthMonitor</span>
+<span class="source-line" id="L26"><a href="#L26">  26</a> from slime.utils.http_utils import init_http_client</span>
+<span class="source-line" id="L27"><a href="#L27">  27</a> from slime.utils.memory_utils import get_process_host_memory_gib</span>
+<span class="source-line" id="L28"><a href="#L28">  28</a> from slime.utils.misc import Box, load_function</span>
+<span class="source-line" id="L29"><a href="#L29">  29</a> from slime.utils.staleness import fully_async_metrics_enabled</span>
+<span class="source-line" id="L30"><a href="#L30">  30</a> from slime.utils.tensor_store import DiskTensorRef</span>
+<span class="source-line" id="L31"><a href="#L31">  31</a> from slime.utils.types import Sample</span>
+<span class="source-line" id="L32"><a href="#L32">  32</a> </span>
+<span class="source-line" id="L33"><a href="#L33">  33</a> from .utils import Lock, add_default_ray_env_vars</span>
+<span class="source-line" id="L34"><a href="#L34">  34</a> </span>
+<span class="source-line" id="L35"><a href="#L35">  35</a> logging.getLogger(&quot;httpx&quot;).setLevel(logging.WARNING)</span>
+<span class="source-line" id="L36"><a href="#L36">  36</a> logging.getLogger(&quot;httpcore&quot;).setLevel(logging.WARNING)</span>
+<span class="source-line" id="L37"><a href="#L37">  37</a> </span>
+<span class="source-line" id="L38"><a href="#L38">  38</a> logger = logging.getLogger(__name__)</span>
+<span class="source-line" id="L39"><a href="#L39">  39</a> </span>
+<span class="source-line" id="L40"><a href="#L40">  40</a> </span>
+<span class="source-line" id="L41"><a href="#L41">  41</a> @ray.remote</span>
+<span class="source-line" id="L42"><a href="#L42">  42</a> class RolloutManager:</span>
+<span class="source-line" id="L43"><a href="#L43">  43</a>     &quot;&quot;&quot;The class to run rollout and convert rollout data to training data.&quot;&quot;&quot;</span>
+<span class="source-line" id="L44"><a href="#L44">  44</a> </span>
+<span class="source-line" id="L45"><a href="#L45">  45</a>     def __init__(self, args, pg):</span>
+<span class="source-line" id="L46"><a href="#L46">  46</a>         configure_logger()</span>
+<span class="source-line" id="L47"><a href="#L47">  47</a> </span>
+<span class="source-line" id="L48"><a href="#L48">  48</a>         self.pg = pg</span>
+<span class="source-line" id="L49"><a href="#L49">  49</a>         self.args = args</span>
+<span class="source-line" id="L50"><a href="#L50">  50</a> </span>
+<span class="source-line" id="L51"><a href="#L51">  51</a>         rollout_init_handles: list[Any] = []</span>
+<span class="source-line" id="L52"><a href="#L52">  52</a>         if self.args.debug_train_only:</span>
+<span class="source-line" id="L53"><a href="#L53">  53</a>             self.servers: dict[str, Any] = {}</span>
+<span class="source-line" id="L54"><a href="#L54">  54</a>         else:</span>
+<span class="source-line" id="L55"><a href="#L55">  55</a>             init_http_client(args)</span>
+<span class="source-line" id="L56"><a href="#L56">  56</a>             self.servers, rollout_init_handles = start_rollout_servers(args, pg)</span>
+<span class="source-line" id="L57"><a href="#L57">  57</a> </span>
+<span class="source-line" id="L58"><a href="#L58">  58</a>         data_source_cls = load_function(self.args.data_source_path)</span>
+<span class="source-line" id="L59"><a href="#L59">  59</a>         self.data_source = data_source_cls(args)</span>
+<span class="source-line" id="L60"><a href="#L60">  60</a> </span>
+<span class="source-line" id="L61"><a href="#L61">  61</a>         self.generate_rollout = load_function(self.args.rollout_function_path)</span>
+<span class="source-line" id="L62"><a href="#L62">  62</a>         self.eval_generate_rollout = load_function(self.args.eval_function_path)</span>
+<span class="source-line" id="L63"><a href="#L63">  63</a>         self.custom_reward_post_process_func = None</span>
+<span class="source-line" id="L64"><a href="#L64">  64</a>         if self.args.custom_reward_post_process_path is not None:</span>
+<span class="source-line" id="L65"><a href="#L65">  65</a>             self.custom_reward_post_process_func = load_function(self.args.custom_reward_post_process_path)</span>
+<span class="source-line" id="L66"><a href="#L66">  66</a>         self.custom_convert_samples_to_train_data_func = None</span>
+<span class="source-line" id="L67"><a href="#L67">  67</a>         if self.args.custom_convert_samples_to_train_data_path is not None:</span>
+<span class="source-line" id="L68"><a href="#L68">  68</a>             self.custom_convert_samples_to_train_data_func = load_function(</span>
+<span class="source-line" id="L69"><a href="#L69">  69</a>                 self.args.custom_convert_samples_to_train_data_path</span>
+<span class="source-line" id="L70"><a href="#L70">  70</a>             )</span>
+<span class="source-line" id="L71"><a href="#L71">  71</a>         logger.info(f&quot;import {self.args.rollout_function_path} as generate_rollout function.&quot;)</span>
+<span class="source-line" id="L72"><a href="#L72">  72</a>         logger.info(f&quot;import {self.args.eval_function_path} as eval_generate_rollout function.&quot;)</span>
+<span class="source-line" id="L73"><a href="#L73">  73</a> </span>
+<span class="source-line" id="L74"><a href="#L74">  74</a>         if rollout_init_handles:</span>
+<span class="source-line" id="L75"><a href="#L75">  75</a>             ray.get(rollout_init_handles)</span>
+<span class="source-line" id="L76"><a href="#L76">  76</a> </span>
+<span class="source-line" id="L77"><a href="#L77">  77</a>         init_tracking(args, primary=False)</span>
+<span class="source-line" id="L78"><a href="#L78">  78</a>         self.rollout_engine_lock = Lock.options(</span>
+<span class="source-line" id="L79"><a href="#L79">  79</a>             num_cpus=1,</span>
+<span class="source-line" id="L80"><a href="#L80">  80</a>             num_gpus=0,</span>
+<span class="source-line" id="L81"><a href="#L81">  81</a>             runtime_env={&quot;env_vars&quot;: add_default_ray_env_vars()},</span>
+<span class="source-line" id="L82"><a href="#L82">  82</a>         ).remote()</span>
+<span class="source-line" id="L83"><a href="#L83">  83</a>         self.rollout_id = -1</span>
+<span class="source-line" id="L84"><a href="#L84">  84</a>         self._active_routed_experts_rollouts: set[int] = set()</span>
+<span class="source-line" id="L85"><a href="#L85">  85</a> </span>
+<span class="source-line" id="L86"><a href="#L86">  86</a>         self._health_monitors = []</span>
+<span class="source-line" id="L87"><a href="#L87">  87</a>         if not self.args.debug_train_only and self.args.use_fault_tolerance:</span>
+<span class="source-line" id="L88"><a href="#L88">  88</a>             for srv in self.servers.values():</span>
+<span class="source-line" id="L89"><a href="#L89">  89</a>                 for group in srv.server_groups:</span>
+<span class="source-line" id="L90"><a href="#L90">  90</a>                     monitor = RolloutHealthMonitor(group, args)</span>
+<span class="source-line" id="L91"><a href="#L91">  91</a>                     monitor.start()</span>
+<span class="source-line" id="L92"><a href="#L92">  92</a>                     self._health_monitors.append(monitor)</span>
+<span class="source-line" id="L93"><a href="#L93">  93</a>             self._ci_fault_injection_pending = self.args.ci_test  # Flag for CI fault injection</span>
+<span class="source-line" id="L94"><a href="#L94">  94</a> </span>
+<span class="source-line" id="L95"><a href="#L95">  95</a>     def _try_ci_fault_injection(self):</span>
+<span class="source-line" id="L96"><a href="#L96">  96</a>         &quot;&quot;&quot;Try to inject fault during generate (when health monitor is running).&quot;&quot;&quot;</span>
+<span class="source-line" id="L97"><a href="#L97">  97</a>         if not self._ci_fault_injection_pending:</span>
+<span class="source-line" id="L98"><a href="#L98">  98</a>             return</span>
+<span class="source-line" id="L99"><a href="#L99">  99</a> </span>
+<span class="source-line" id="L100"><a href="#L100"> 100</a>         # Only inject fault once</span>
+<span class="source-line" id="L101"><a href="#L101"> 101</a>         self._ci_fault_injection_pending = False</span>
+<span class="source-line" id="L102"><a href="#L102"> 102</a> </span>
+<span class="source-line" id="L103"><a href="#L103"> 103</a>         if (</span>
+<span class="source-line" id="L104"><a href="#L104"> 104</a>             self.server</span>
+<span class="source-line" id="L105"><a href="#L105"> 105</a>             and self.server.server_groups</span>
+<span class="source-line" id="L106"><a href="#L106"> 106</a>             and self.server.server_groups[0].all_engines</span>
+<span class="source-line" id="L107"><a href="#L107"> 107</a>             and self.server.server_groups[0].all_engines[0]</span>
+<span class="source-line" id="L108"><a href="#L108"> 108</a>         ):</span>
+<span class="source-line" id="L109"><a href="#L109"> 109</a>             logger.info(&quot;CI Fault Injection: Simulating crash on engine 0 during generate&quot;)</span>
+<span class="source-line" id="L110"><a href="#L110"> 110</a>             try:</span>
+<span class="source-line" id="L111"><a href="#L111"> 111</a>                 # This will cause the ray actor to exit</span>
+<span class="source-line" id="L112"><a href="#L112"> 112</a>                 self.server.server_groups[0].all_engines[0].simulate_crash.remote()</span>
+<span class="source-line" id="L113"><a href="#L113"> 113</a>                 # Wait for health monitor to detect the crash and mark engine as None</span>
+<span class="source-line" id="L114"><a href="#L114"> 114</a>                 # health_check_interval + health_check_timeout + buffer</span>
+<span class="source-line" id="L115"><a href="#L115"> 115</a>                 wait_time = self.args.rollout_health_check_interval + self.args.rollout_health_check_timeout + 5</span>
+<span class="source-line" id="L116"><a href="#L116"> 116</a>                 logger.info(f&quot;CI Fault Injection: Waiting {wait_time}s for health monitor to detect crash&quot;)</span>
+<span class="source-line" id="L117"><a href="#L117"> 117</a>                 time.sleep(wait_time)</span>
+<span class="source-line" id="L118"><a href="#L118"> 118</a>             except Exception as e:</span>
+<span class="source-line" id="L119"><a href="#L119"> 119</a>                 logger.warning(f&quot;CI Fault Injection failed: {e}&quot;)</span>
+<span class="source-line" id="L120"><a href="#L120"> 120</a> </span>
+<span class="source-line" id="L121"><a href="#L121"> 121</a>     def dispose(self):</span>
+<span class="source-line" id="L122"><a href="#L122"> 122</a>         for monitor in self._health_monitors:</span>
+<span class="source-line" id="L123"><a href="#L123"> 123</a>             monitor.stop()</span>
+<span class="source-line" id="L124"><a href="#L124"> 124</a>         for rollout_id in list(self._active_routed_experts_rollouts):</span>
+<span class="source-line" id="L125"><a href="#L125"> 125</a>             self.cleanup_rollout_data(rollout_id)</span>
+<span class="source-line" id="L126"><a href="#L126"> 126</a>         logging_utils.finish_tracking(self.args)</span>
+<span class="source-line" id="L127"><a href="#L127"> 127</a> </span>
+<span class="source-line" id="L128"><a href="#L128"> 128</a>     def cleanup_rollout_data(self, rollout_id: int) -&gt; None:</span>
+<span class="source-line" id="L129"><a href="#L129"> 129</a>         from slime.utils.routed_experts import cleanup_routed_experts_rollout</span>
+<span class="source-line" id="L130"><a href="#L130"> 130</a> </span>
+<span class="source-line" id="L131"><a href="#L131"> 131</a>         cleanup_routed_experts_rollout(self.args, rollout_id)</span>
+<span class="source-line" id="L132"><a href="#L132"> 132</a>         self._active_routed_experts_rollouts.discard(rollout_id)</span>
+<span class="source-line" id="L133"><a href="#L133"> 133</a> </span>
+<span class="source-line" id="L134"><a href="#L134"> 134</a>     @property</span>
+<span class="source-line" id="L135"><a href="#L135"> 135</a>     def server(self) -&gt; Any | None:</span>
+<span class="source-line" id="L136"><a href="#L136"> 136</a>         &quot;&quot;&quot;Default server (first model).  For backward compatibility.&quot;&quot;&quot;</span>
+<span class="source-line" id="L137"><a href="#L137"> 137</a>         if not self.servers:</span>
+<span class="source-line" id="L138"><a href="#L138"> 138</a>             return None</span>
+<span class="source-line" id="L139"><a href="#L139"> 139</a>         return next(iter(self.servers.values()))</span>
+<span class="source-line" id="L140"><a href="#L140"> 140</a> </span>
+<span class="source-line" id="L141"><a href="#L141"> 141</a>     def _get_updatable_server(self) -&gt; Any | None:</span>
+<span class="source-line" id="L142"><a href="#L142"> 142</a>         &quot;&quot;&quot;Return the server with ``update_weights=True``.</span>
+<span class="source-line" id="L143"><a href="#L143"> 143</a> </span>
+<span class="source-line" id="L144"><a href="#L144"> 144</a>         When multiple updatable servers exist, returns the first one</span>
+<span class="source-line" id="L145"><a href="#L145"> 145</a>         (multi-model weight update is not yet supported).</span>
+<span class="source-line" id="L146"><a href="#L146"> 146</a>         &quot;&quot;&quot;</span>
+<span class="source-line" id="L147"><a href="#L147"> 147</a>         for srv in self.servers.values():</span>
+<span class="source-line" id="L148"><a href="#L148"> 148</a>             if srv.update_weights:</span>
+<span class="source-line" id="L149"><a href="#L149"> 149</a>                 return srv</span>
+<span class="source-line" id="L150"><a href="#L150"> 150</a>         return None</span>
+<span class="source-line" id="L151"><a href="#L151"> 151</a> </span>
+<span class="source-line" id="L152"><a href="#L152"> 152</a>     @property</span>
+<span class="source-line" id="L153"><a href="#L153"> 153</a>     def rollout_engines(self):</span>
+<span class="source-line" id="L154"><a href="#L154"> 154</a>         &quot;&quot;&quot;All node-0 engines across all servers / models.&quot;&quot;&quot;</span>
+<span class="source-line" id="L155"><a href="#L155"> 155</a>         return [e for srv in self.servers.values() for e in srv.engines]</span>
+<span class="source-line" id="L156"><a href="#L156"> 156</a> </span>
+<span class="source-line" id="L157"><a href="#L157"> 157</a>     def get_updatable_engines_and_lock(self):</span>
+<span class="source-line" id="L158"><a href="#L158"> 158</a>         &quot;&quot;&quot;Return engines eligible for weight updates.</span>
+<span class="source-line" id="L159"><a href="#L159"> 159</a> </span>
+<span class="source-line" id="L160"><a href="#L160"> 160</a>         Returns engines from the first model that has</span>
+<span class="source-line" id="L161"><a href="#L161"> 161</a>         ``update_weights=True``.  Frozen models (reference, reward,</span>
+<span class="source-line" id="L162"><a href="#L162"> 162</a>         etc.) are automatically excluded.</span>
+<span class="source-line" id="L163"><a href="#L163"> 163</a>         &quot;&quot;&quot;</span>
+<span class="source-line" id="L164"><a href="#L164"> 164</a>         srv = self._get_updatable_server()</span>
+<span class="source-line" id="L165"><a href="#L165"> 165</a>         engines = srv.engines if srv else []</span>
+<span class="source-line" id="L166"><a href="#L166"> 166</a>         gpu_counts = srv.engine_gpu_counts if srv else []</span>
+<span class="source-line" id="L167"><a href="#L167"> 167</a>         gpu_offsets = srv.engine_gpu_offsets if srv else []</span>
+<span class="source-line" id="L168"><a href="#L168"> 168</a>         parallel_configs = srv.engine_parallel_configs if srv else []</span>
+<span class="source-line" id="L169"><a href="#L169"> 169</a>         num_new = srv.num_new_engines if srv else 0</span>
+<span class="source-line" id="L170"><a href="#L170"> 170</a>         return engines, self.rollout_engine_lock, num_new, gpu_counts, gpu_offsets, parallel_configs</span>
+<span class="source-line" id="L171"><a href="#L171"> 171</a> </span>
+<span class="source-line" id="L172"><a href="#L172"> 172</a>     def get_num_rollout_per_epoch(self):</span>
+<span class="source-line" id="L173"><a href="#L173"> 173</a>         assert self.args.rollout_global_dataset</span>
+<span class="source-line" id="L174"><a href="#L174"> 174</a>         return len(self.data_source) // self.args.rollout_batch_size</span>
+<span class="source-line" id="L175"><a href="#L175"> 175</a> </span>
+<span class="source-line" id="L176"><a href="#L176"> 176</a>     def generate(self, rollout_id):</span>
+<span class="source-line" id="L177"><a href="#L177"> 177</a>         start_time = time.time()</span>
+<span class="source-line" id="L178"><a href="#L178"> 178</a>         self.rollout_id = rollout_id</span>
+<span class="source-line" id="L179"><a href="#L179"> 179</a>         set_current_rollout_id(rollout_id)</span>
+<span class="source-line" id="L180"><a href="#L180"> 180</a>         self.health_monitoring_resume()</span>
+<span class="source-line" id="L181"><a href="#L181"> 181</a>         if self.args.ci_test and self.args.use_fault_tolerance and rollout_id &gt;= 2:</span>
+<span class="source-line" id="L182"><a href="#L182"> 182</a>             self._try_ci_fault_injection()</span>
+<span class="source-line" id="L183"><a href="#L183"> 183</a>         data, metrics = self._get_rollout_data(rollout_id=rollout_id)</span>
+<span class="source-line" id="L184"><a href="#L184"> 184</a>         disk_routes = [</span>
+<span class="source-line" id="L185"><a href="#L185"> 185</a>             sample.rollout_routed_experts</span>
+<span class="source-line" id="L186"><a href="#L186"> 186</a>             for sample in data</span>
+<span class="source-line" id="L187"><a href="#L187"> 187</a>             if isinstance(sample.rollout_routed_experts, DiskTensorRef)</span>
+<span class="source-line" id="L188"><a href="#L188"> 188</a>         ]</span>
+<span class="source-line" id="L189"><a href="#L189"> 189</a>         if disk_routes:</span>
+<span class="source-line" id="L190"><a href="#L190"> 190</a>             self._active_routed_experts_rollouts.add(rollout_id)</span>
+<span class="source-line" id="L191"><a href="#L191"> 191</a>             rss_gib, hwm_gib = get_process_host_memory_gib()</span>
+<span class="source-line" id="L192"><a href="#L192"> 192</a>             logger.info(</span>
+<span class="source-line" id="L193"><a href="#L193"> 193</a>                 &quot;R3 manager spill profile: rollout_id=%d samples=%d files=%d disk_bytes=%.3f GiB &quot;</span>
+<span class="source-line" id="L194"><a href="#L194"> 194</a>                 &quot;rss=%.3f GiB hwm=%.3f GiB host_available=%.3f GiB&quot;,</span>
+<span class="source-line" id="L195"><a href="#L195"> 195</a>                 rollout_id,</span>
+<span class="source-line" id="L196"><a href="#L196"> 196</a>                 len(data),</span>
+<span class="source-line" id="L197"><a href="#L197"> 197</a>                 len(disk_routes),</span>
+<span class="source-line" id="L198"><a href="#L198"> 198</a>                 sum(ref.nbytes for ref in disk_routes) / 1024**3,</span>
+<span class="source-line" id="L199"><a href="#L199"> 199</a>                 rss_gib,</span>
+<span class="source-line" id="L200"><a href="#L200"> 200</a>                 hwm_gib,</span>
+<span class="source-line" id="L201"><a href="#L201"> 201</a>                 psutil.virtual_memory().available / 1024**3,</span>
+<span class="source-line" id="L202"><a href="#L202"> 202</a>             )</span>
+<span class="source-line" id="L203"><a href="#L203"> 203</a>         save_debug_rollout_data(</span>
+<span class="source-line" id="L204"><a href="#L204"> 204</a>             self.args.save_debug_rollout_data,</span>
+<span class="source-line" id="L205"><a href="#L205"> 205</a>             data,</span>
+<span class="source-line" id="L206"><a href="#L206"> 206</a>             rollout_id=rollout_id,</span>
+<span class="source-line" id="L207"><a href="#L207"> 207</a>             evaluation=False,</span>
+<span class="source-line" id="L208"><a href="#L208"> 208</a>         )</span>
+<span class="source-line" id="L209"><a href="#L209"> 209</a>         log_rollout_data(rollout_id, self.args, data, metrics, time.time() - start_time)</span>
+<span class="source-line" id="L210"><a href="#L210"> 210</a>         if self.args.debug_rollout_only:</span>
+<span class="source-line" id="L211"><a href="#L211"> 211</a>             # if debug rollout only, we don&#x27;t convert samples to train data and directly return</span>
+<span class="source-line" id="L212"><a href="#L212"> 212</a>             return</span>
+<span class="source-line" id="L213"><a href="#L213"> 213</a>         data = self._convert_samples_to_train_data(data)</span>
+<span class="source-line" id="L214"><a href="#L214"> 214</a>         return self._split_train_data_by_dp(data)</span>
+<span class="source-line" id="L215"><a href="#L215"> 215</a> </span>
+<span class="source-line" id="L216"><a href="#L216"> 216</a>     def eval(self, rollout_id):</span>
+<span class="source-line" id="L217"><a href="#L217"> 217</a>         if self.args.debug_train_only:</span>
+<span class="source-line" id="L218"><a href="#L218"> 218</a>             # if debug train only, we don&#x27;t generate evaluation data</span>
+<span class="source-line" id="L219"><a href="#L219"> 219</a>             return</span>
+<span class="source-line" id="L220"><a href="#L220"> 220</a>         set_current_rollout_id(rollout_id)</span>
+<span class="source-line" id="L221"><a href="#L221"> 221</a>         self.health_monitoring_resume()</span>
+<span class="source-line" id="L222"><a href="#L222"> 222</a> </span>
+<span class="source-line" id="L223"><a href="#L223"> 223</a>         result = call_rollout_fn(self.eval_generate_rollout, self.args, rollout_id, self.data_source, evaluation=True)</span>
+<span class="source-line" id="L224"><a href="#L224"> 224</a>         data = result.data</span>
+<span class="source-line" id="L225"><a href="#L225"> 225</a>         save_debug_rollout_data(</span>
+<span class="source-line" id="L226"><a href="#L226"> 226</a>             self.args.save_debug_rollout_data,</span>
+<span class="source-line" id="L227"><a href="#L227"> 227</a>             data,</span>
+<span class="source-line" id="L228"><a href="#L228"> 228</a>             rollout_id=rollout_id,</span>
+<span class="source-line" id="L229"><a href="#L229"> 229</a>             evaluation=True,</span>
+<span class="source-line" id="L230"><a href="#L230"> 230</a>         )</span>
+<span class="source-line" id="L231"><a href="#L231"> 231</a>         log_eval_rollout_data(rollout_id, self.args, data, result.metrics)</span>
+<span class="source-line" id="L232"><a href="#L232"> 232</a> </span>
+<span class="source-line" id="L233"><a href="#L233"> 233</a>     def save(self, rollout_id):</span>
+<span class="source-line" id="L234"><a href="#L234"> 234</a>         self.data_source.save(rollout_id)</span>
+<span class="source-line" id="L235"><a href="#L235"> 235</a> </span>
+<span class="source-line" id="L236"><a href="#L236"> 236</a>     def load(self, rollout_id=None):</span>
+<span class="source-line" id="L237"><a href="#L237"> 237</a>         self.data_source.load(rollout_id)</span>
+<span class="source-line" id="L238"><a href="#L238"> 238</a> </span>
+<span class="source-line" id="L239"><a href="#L239"> 239</a>     def offload(self):</span>
+<span class="source-line" id="L240"><a href="#L240"> 240</a>         self.health_monitoring_pause()</span>
+<span class="source-line" id="L241"><a href="#L241"> 241</a>         for srv in self.servers.values():</span>
+<span class="source-line" id="L242"><a href="#L242"> 242</a>             srv.offload()</span>
+<span class="source-line" id="L243"><a href="#L243"> 243</a> </span>
+<span class="source-line" id="L244"><a href="#L244"> 244</a>     def onload(self, tags: list[str] | None = None):</span>
+<span class="source-line" id="L245"><a href="#L245"> 245</a>         for srv in self.servers.values():</span>
+<span class="source-line" id="L246"><a href="#L246"> 246</a>             srv.onload(tags)</span>
+<span class="source-line" id="L247"><a href="#L247"> 247</a> </span>
+<span class="source-line" id="L248"><a href="#L248"> 248</a>     def onload_weights(self):</span>
+<span class="source-line" id="L249"><a href="#L249"> 249</a>         for srv in self.servers.values():</span>
+<span class="source-line" id="L250"><a href="#L250"> 250</a>             srv.onload_weights()</span>
+<span class="source-line" id="L251"><a href="#L251"> 251</a> </span>
+<span class="source-line" id="L252"><a href="#L252"> 252</a>     def onload_kv(self):</span>
+<span class="source-line" id="L253"><a href="#L253"> 253</a>         for srv in self.servers.values():</span>
+<span class="source-line" id="L254"><a href="#L254"> 254</a>             srv.onload_kv()</span>
+<span class="source-line" id="L255"><a href="#L255"> 255</a> </span>
+<span class="source-line" id="L256"><a href="#L256"> 256</a>     def recover_updatable_engines(self):</span>
+<span class="source-line" id="L257"><a href="#L257"> 257</a>         &quot;&quot;&quot;Restart dead updatable rollout engines before the next weight update.</span>
+<span class="source-line" id="L258"><a href="#L258"> 258</a> </span>
+<span class="source-line" id="L259"><a href="#L259"> 259</a>         Recovers the updatable model (the one that receives weight</span>
+<span class="source-line" id="L260"><a href="#L260"> 260</a>         updates from training).</span>
+<span class="source-line" id="L261"><a href="#L261"> 261</a>         &quot;&quot;&quot;</span>
+<span class="source-line" id="L262"><a href="#L262"> 262</a>         self.health_monitoring_pause()</span>
+<span class="source-line" id="L263"><a href="#L263"> 263</a>         srv = self._get_updatable_server()</span>
+<span class="source-line" id="L264"><a href="#L264"> 264</a>         if self.rollout_id == -1 or srv is None:</span>
+<span class="source-line" id="L265"><a href="#L265"> 265</a>             return</span>
+<span class="source-line" id="L266"><a href="#L266"> 266</a> </span>
+<span class="source-line" id="L267"><a href="#L267"> 267</a>         srv.recover()</span>
+<span class="source-line" id="L268"><a href="#L268"> 268</a> </span>
+<span class="source-line" id="L269"><a href="#L269"> 269</a>     def clear_updatable_num_new_engines(self):</span>
+<span class="source-line" id="L270"><a href="#L270"> 270</a>         # when fault tolerance is not enabled, we need to manually clear num_new_engines after update_weights</span>
+<span class="source-line" id="L271"><a href="#L271"> 271</a>         srv = self._get_updatable_server()</span>
+<span class="source-line" id="L272"><a href="#L272"> 272</a>         if srv:</span>
+<span class="source-line" id="L273"><a href="#L273"> 273</a>             srv.num_new_engines = 0</span>
+<span class="source-line" id="L274"><a href="#L274"> 274</a> </span>
+<span class="source-line" id="L275"><a href="#L275"> 275</a>     def health_monitoring_pause(self) -&gt; None:</span>
+<span class="source-line" id="L276"><a href="#L276"> 276</a>         for monitor in self._health_monitors:</span>
+<span class="source-line" id="L277"><a href="#L277"> 277</a>             monitor.pause()</span>
+<span class="source-line" id="L278"><a href="#L278"> 278</a> </span>
+<span class="source-line" id="L279"><a href="#L279"> 279</a>     def health_monitoring_resume(self) -&gt; None:</span>
+<span class="source-line" id="L280"><a href="#L280"> 280</a>         for monitor in self._health_monitors:</span>
+<span class="source-line" id="L281"><a href="#L281"> 281</a>             monitor.resume()</span>
+<span class="source-line" id="L282"><a href="#L282"> 282</a> </span>
+<span class="source-line" id="L283"><a href="#L283"> 283</a>     def check_weights(self, action: str):</span>
+<span class="source-line" id="L284"><a href="#L284"> 284</a>         return ray.get([engine.check_weights.remote(action=action) for engine in self.rollout_engines])</span>
+<span class="source-line" id="L285"><a href="#L285"> 285</a> </span>
+<span class="source-line" id="L286"><a href="#L286"> 286</a>     def _get_rollout_data(self, rollout_id):</span>
+<span class="source-line" id="L287"><a href="#L287"> 287</a>         if self.args.load_debug_rollout_data:</span>
+<span class="source-line" id="L288"><a href="#L288"> 288</a>             data = load_debug_rollout_data(</span>
+<span class="source-line" id="L289"><a href="#L289"> 289</a>                 self.args.load_debug_rollout_data,</span>
+<span class="source-line" id="L290"><a href="#L290"> 290</a>                 rollout_id=rollout_id,</span>
+<span class="source-line" id="L291"><a href="#L291"> 291</a>                 subsample_ratio=self.args.load_debug_rollout_data_subsample,</span>
+<span class="source-line" id="L292"><a href="#L292"> 292</a>             )</span>
+<span class="source-line" id="L293"><a href="#L293"> 293</a>             metrics = None</span>
+<span class="source-line" id="L294"><a href="#L294"> 294</a>         else:</span>
+<span class="source-line" id="L295"><a href="#L295"> 295</a>             if fully_async_metrics_enabled(self.args):</span>
+<span class="source-line" id="L296"><a href="#L296"> 296</a>                 # The training loop keeps serving weights fixed while collecting</span>
+<span class="source-line" id="L297"><a href="#L297"> 297</a>                 # this batch. Query only the updatable model.</span>
+<span class="source-line" id="L298"><a href="#L298"> 298</a>                 server = self._get_updatable_server()</span>
+<span class="source-line" id="L299"><a href="#L299"> 299</a>                 engines = [engine for engine in server.engines if engine is not None] if server else []</span>
+<span class="source-line" id="L300"><a href="#L300"> 300</a>                 versions = ray.get([engine.get_weight_version.remote() for engine in engines])</span>
+<span class="source-line" id="L301"><a href="#L301"> 301</a>                 valid = bool(versions) and all(</span>
+<span class="source-line" id="L302"><a href="#L302"> 302</a>                     str(version).isascii() and str(version).isdigit() for version in versions</span>
+<span class="source-line" id="L303"><a href="#L303"> 303</a>                 )</span>
+<span class="source-line" id="L304"><a href="#L304"> 304</a>                 self.args._rollout_weight_version = max(map(int, versions)) if valid else None</span>
+<span class="source-line" id="L305"><a href="#L305"> 305</a>             data = call_rollout_fn(self.generate_rollout, self.args, rollout_id, self.data_source, evaluation=False)</span>
+<span class="source-line" id="L306"><a href="#L306"> 306</a>             metrics = data.metrics</span>
+<span class="source-line" id="L307"><a href="#L307"> 307</a>             data = data.samples</span>
+<span class="source-line" id="L308"><a href="#L308"> 308</a>             # Enforce the rollout_id contract before flattening: any list[Sample]</span>
+<span class="source-line" id="L309"><a href="#L309"> 309</a>             # encountered in the nested output must have rollout_id set on every</span>
+<span class="source-line" id="L310"><a href="#L310"> 310</a>             # element. Default rollouts inherit it from the data source; compact /</span>
+<span class="source-line" id="L311"><a href="#L311"> 311</a>             # subagent paths that split one rollout into N training samples must</span>
+<span class="source-line" id="L312"><a href="#L312"> 312</a>             # set the same rollout_id on every sibling so the loss reducer counts</span>
+<span class="source-line" id="L313"><a href="#L313"> 313</a>             # the rollout once instead of N times.</span>
+<span class="source-line" id="L314"><a href="#L314"> 314</a>             validate_rollout_id_annotated(data)</span>
+<span class="source-line" id="L315"><a href="#L315"> 315</a>             # flatten the data if it is a list of lists</span>
+<span class="source-line" id="L316"><a href="#L316"> 316</a>             while isinstance(data[0], list):</span>
+<span class="source-line" id="L317"><a href="#L317"> 317</a>                 data = list(itertools.chain.from_iterable(data))</span>
+<span class="source-line" id="L318"><a href="#L318"> 318</a> </span>
+<span class="source-line" id="L319"><a href="#L319"> 319</a>         return data, metrics</span>
+<span class="source-line" id="L320"><a href="#L320"> 320</a> </span>
+<span class="source-line" id="L321"><a href="#L321"> 321</a>     def _post_process_rewards(self, samples: list[Sample] | list[list[Sample]]):</span>
+<span class="source-line" id="L322"><a href="#L322"> 322</a>         if self.custom_reward_post_process_func is not None:</span>
+<span class="source-line" id="L323"><a href="#L323"> 323</a>             return self.custom_reward_post_process_func(self.args, samples)</span>
+<span class="source-line" id="L324"><a href="#L324"> 324</a> </span>
+<span class="source-line" id="L325"><a href="#L325"> 325</a>         raw_rewards = [sample.get_reward_value(self.args) for sample in samples]</span>
+<span class="source-line" id="L326"><a href="#L326"> 326</a>         if (</span>
+<span class="source-line" id="L327"><a href="#L327"> 327</a>             self.args.advantage_estimator in [&quot;grpo&quot;, &quot;gspo&quot;, &quot;cispo&quot;, &quot;reinforce_plus_plus_baseline&quot;]</span>
+<span class="source-line" id="L328"><a href="#L328"> 328</a>             and self.args.rewards_normalization</span>
+<span class="source-line" id="L329"><a href="#L329"> 329</a>         ):</span>
+<span class="source-line" id="L330"><a href="#L330"> 330</a>             # group norm</span>
+<span class="source-line" id="L331"><a href="#L331"> 331</a>             rewards = torch.tensor(raw_rewards, dtype=torch.float)</span>
+<span class="source-line" id="L332"><a href="#L332"> 332</a>             if rewards.shape[-1] == self.args.n_samples_per_prompt * self.args.rollout_batch_size:</span>
+<span class="source-line" id="L333"><a href="#L333"> 333</a>                 rewards = rewards.reshape(-1, self.args.n_samples_per_prompt)</span>
+<span class="source-line" id="L334"><a href="#L334"> 334</a>             else:</span>
+<span class="source-line" id="L335"><a href="#L335"> 335</a>                 # when samples count are not equal in each group</span>
+<span class="source-line" id="L336"><a href="#L336"> 336</a>                 rewards = rewards.view(-1, rewards.shape[-1])</span>
+<span class="source-line" id="L337"><a href="#L337"> 337</a>             mean = rewards.mean(dim=-1, keepdim=True)</span>
+<span class="source-line" id="L338"><a href="#L338"> 338</a>             rewards = rewards - mean</span>
+<span class="source-line" id="L339"><a href="#L339"> 339</a> </span>
+<span class="source-line" id="L340"><a href="#L340"> 340</a>             if self.args.advantage_estimator in [&quot;grpo&quot;, &quot;gspo&quot;, &quot;cispo&quot;] and self.args.grpo_std_normalization:</span>
+<span class="source-line" id="L341"><a href="#L341"> 341</a>                 std = rewards.std(dim=-1, keepdim=True)</span>
+<span class="source-line" id="L342"><a href="#L342"> 342</a>                 rewards = rewards / (std + 1e-6)</span>
+<span class="source-line" id="L343"><a href="#L343"> 343</a> </span>
+<span class="source-line" id="L344"><a href="#L344"> 344</a>             return raw_rewards, rewards.flatten().tolist()</span>
+<span class="source-line" id="L345"><a href="#L345"> 345</a> </span>
+<span class="source-line" id="L346"><a href="#L346"> 346</a>         return raw_rewards, raw_rewards</span>
+<span class="source-line" id="L347"><a href="#L347"> 347</a> </span>
+<span class="source-line" id="L348"><a href="#L348"> 348</a>     def _convert_samples_to_train_data(self, samples: list[Sample] | list[list[Sample]]):</span>
+<span class="source-line" id="L349"><a href="#L349"> 349</a>         &quot;&quot;&quot;</span>
+<span class="source-line" id="L350"><a href="#L350"> 350</a>         Convert inference generated samples to training data.</span>
+<span class="source-line" id="L351"><a href="#L351"> 351</a>         &quot;&quot;&quot;</span>
+<span class="source-line" id="L352"><a href="#L352"> 352</a>         if self.custom_convert_samples_to_train_data_func is not None:</span>
+<span class="source-line" id="L353"><a href="#L353"> 353</a>             return self.custom_convert_samples_to_train_data_func(self.args, samples)</span>
+<span class="source-line" id="L354"><a href="#L354"> 354</a> </span>
+<span class="source-line" id="L355"><a href="#L355"> 355</a>         raw_rewards, rewards = self._post_process_rewards(samples)</span>
+<span class="source-line" id="L356"><a href="#L356"> 356</a> </span>
+<span class="source-line" id="L357"><a href="#L357"> 357</a>         assert len(raw_rewards) == len(samples)</span>
+<span class="source-line" id="L358"><a href="#L358"> 358</a>         assert len(rewards) == len(samples)</span>
+<span class="source-line" id="L359"><a href="#L359"> 359</a> </span>
+<span class="source-line" id="L360"><a href="#L360"> 360</a>         rollout_ids = [sample.rollout_id for sample in samples]</span>
+<span class="source-line" id="L361"><a href="#L361"> 361</a>         existed_rollout_id_values = set(rid for rid in rollout_ids if rid is not None)</span>
+<span class="source-line" id="L362"><a href="#L362"> 362</a>         tmp_id = 0</span>
+<span class="source-line" id="L363"><a href="#L363"> 363</a>         for i in range(len(rollout_ids)):</span>
+<span class="source-line" id="L364"><a href="#L364"> 364</a>             if rollout_ids[i] is None:</span>
+<span class="source-line" id="L365"><a href="#L365"> 365</a>                 while tmp_id in existed_rollout_id_values:</span>
+<span class="source-line" id="L366"><a href="#L366"> 366</a>                     tmp_id += 1</span>
+<span class="source-line" id="L367"><a href="#L367"> 367</a>                 rollout_ids[i] = tmp_id</span>
+<span class="source-line" id="L368"><a href="#L368"> 368</a>                 existed_rollout_id_values.add(tmp_id)</span>
+<span class="source-line" id="L369"><a href="#L369"> 369</a> </span>
+<span class="source-line" id="L370"><a href="#L370"> 370</a>         train_data = {</span>
+<span class="source-line" id="L371"><a href="#L371"> 371</a>             &quot;tokens&quot;: [sample.tokens for sample in samples],</span>
+<span class="source-line" id="L372"><a href="#L372"> 372</a>             &quot;response_lengths&quot;: [sample.response_length for sample in samples],</span>
+<span class="source-line" id="L373"><a href="#L373"> 373</a>             # some reward model, e.g. remote rm, may return multiple rewards,</span>
+<span class="source-line" id="L374"><a href="#L374"> 374</a>             # we could use key to select the reward.</span>
+<span class="source-line" id="L375"><a href="#L375"> 375</a>             &quot;rewards&quot;: rewards,</span>
+<span class="source-line" id="L376"><a href="#L376"> 376</a>             &quot;raw_reward&quot;: raw_rewards,</span>
+<span class="source-line" id="L377"><a href="#L377"> 377</a>             &quot;truncated&quot;: [1 if sample.status == Sample.Status.TRUNCATED else 0 for sample in samples],</span>
+<span class="source-line" id="L378"><a href="#L378"> 378</a>             &quot;sample_indices&quot;: [sample.index for sample in samples],</span>
+<span class="source-line" id="L379"><a href="#L379"> 379</a>             &quot;rollout_ids&quot;: rollout_ids,</span>
+<span class="source-line" id="L380"><a href="#L380"> 380</a>         }</span>
+<span class="source-line" id="L381"><a href="#L381"> 381</a> </span>
+<span class="source-line" id="L382"><a href="#L382"> 382</a>         # loss mask</span>
+<span class="source-line" id="L383"><a href="#L383"> 383</a>         # TODO: compress the loss mask</span>
+<span class="source-line" id="L384"><a href="#L384"> 384</a>         loss_masks = []</span>
+<span class="source-line" id="L385"><a href="#L385"> 385</a>         for sample in samples:</span>
+<span class="source-line" id="L386"><a href="#L386"> 386</a>             # always instantiate loss_mask if not provided</span>
+<span class="source-line" id="L387"><a href="#L387"> 387</a>             if sample.loss_mask is None:</span>
+<span class="source-line" id="L388"><a href="#L388"> 388</a>                 sample.loss_mask = [1] * sample.response_length</span>
+<span class="source-line" id="L389"><a href="#L389"> 389</a> </span>
+<span class="source-line" id="L390"><a href="#L390"> 390</a>             assert (</span>
+<span class="source-line" id="L391"><a href="#L391"> 391</a>                 len(sample.loss_mask) == sample.response_length</span>
+<span class="source-line" id="L392"><a href="#L392"> 392</a>             ), f&quot;loss mask length {len(sample.loss_mask)} != response length {sample.response_length}&quot;</span>
+<span class="source-line" id="L393"><a href="#L393"> 393</a>             if sample.remove_sample:</span>
+<span class="source-line" id="L394"><a href="#L394"> 394</a>                 sample.loss_mask = [0] * sample.response_length</span>
+<span class="source-line" id="L395"><a href="#L395"> 395</a>             loss_masks.append(sample.loss_mask)</span>
+<span class="source-line" id="L396"><a href="#L396"> 396</a>         train_data[&quot;loss_masks&quot;] = loss_masks</span>
+<span class="source-line" id="L397"><a href="#L397"> 397</a> </span>
+<span class="source-line" id="L398"><a href="#L398"> 398</a>         # Per-rollout aggregate, precomputed at the step level (where we can</span>
+<span class="source-line" id="L399"><a href="#L399"> 399</a>         # see every sample of every rollout) and broadcast per-sample so the</span>
+<span class="source-line" id="L400"><a href="#L400"> 400</a>         # per-mb loss reducer uses the correct whole-rollout denominator even</span>
+<span class="source-line" id="L401"><a href="#L401"> 401</a>         # when a rollout&#x27;s samples land in different micro-batches (first-fit</span>
+<span class="source-line" id="L402"><a href="#L402"> 402</a>         # packing can split a rollout across mbs):</span>
+<span class="source-line" id="L403"><a href="#L403"> 403</a>         #</span>
+<span class="source-line" id="L404"><a href="#L404"> 404</a>         #   ``rollout_mask_sums[i]`` — sum of loss-mask totals over every</span>
+<span class="source-line" id="L405"><a href="#L405"> 405</a>         #   sample in sample i&#x27;s rollout. Used as the reducer&#x27;s denominator</span>
+<span class="source-line" id="L406"><a href="#L406"> 406</a>         #   so summing partial contributions across mbs yields one</span>
+<span class="source-line" id="L407"><a href="#L407"> 407</a>         #   token-weighted mean per rollout.</span>
+<span class="source-line" id="L408"><a href="#L408"> 408</a>         rollout_id_list = train_data[&quot;rollout_ids&quot;]</span>
+<span class="source-line" id="L409"><a href="#L409"> 409</a>         mask_sums_per_sample = [sum(m) for m in loss_masks]</span>
+<span class="source-line" id="L410"><a href="#L410"> 410</a>         rollout_total_mask: dict[int, int] = {}</span>
+<span class="source-line" id="L411"><a href="#L411"> 411</a>         for rid, ms in zip(rollout_id_list, mask_sums_per_sample, strict=True):</span>
+<span class="source-line" id="L412"><a href="#L412"> 412</a>             rollout_total_mask[rid] = rollout_total_mask.get(rid, 0) + ms</span>
+<span class="source-line" id="L413"><a href="#L413"> 413</a>         train_data[&quot;rollout_mask_sums&quot;] = [rollout_total_mask[rid] for rid in rollout_id_list]</span>
+<span class="source-line" id="L414"><a href="#L414"> 414</a> </span>
+<span class="source-line" id="L415"><a href="#L415"> 415</a>         # Overwrite raw_reward when available. Mixed-source batches may only</span>
+<span class="source-line" id="L416"><a href="#L416"> 416</a>         # populate this field for a subset of samples (e.g. SWE but not code).</span>
+<span class="source-line" id="L417"><a href="#L417"> 417</a>         if any(sample.metadata and &quot;raw_reward&quot; in sample.metadata for sample in samples):</span>
+<span class="source-line" id="L418"><a href="#L418"> 418</a>             train_data[&quot;raw_reward&quot;] = [</span>
+<span class="source-line" id="L419"><a href="#L419"> 419</a>                 sample.metadata[&quot;raw_reward&quot;] if sample.metadata and &quot;raw_reward&quot; in sample.metadata else sample.reward</span>
+<span class="source-line" id="L420"><a href="#L420"> 420</a>                 for sample in samples</span>
+<span class="source-line" id="L421"><a href="#L421"> 421</a>             ]</span>
+<span class="source-line" id="L422"><a href="#L422"> 422</a> </span>
+<span class="source-line" id="L423"><a href="#L423"> 423</a>         # For rollout buffer</span>
+<span class="source-line" id="L424"><a href="#L424"> 424</a>         if samples[0].metadata and &quot;round_number&quot; in samples[0].metadata:</span>
+<span class="source-line" id="L425"><a href="#L425"> 425</a>             train_data[&quot;round_number&quot;] = [sample.metadata[&quot;round_number&quot;] for sample in samples]</span>
+<span class="source-line" id="L426"><a href="#L426"> 426</a> </span>
+<span class="source-line" id="L427"><a href="#L427"> 427</a>         # Add rollout log probabilities for off-policy correction</span>
+<span class="source-line" id="L428"><a href="#L428"> 428</a>         if samples[0].rollout_log_probs is not None:</span>
+<span class="source-line" id="L429"><a href="#L429"> 429</a>             train_data[&quot;rollout_log_probs&quot;] = [sample.rollout_log_probs for sample in samples]</span>
+<span class="source-line" id="L430"><a href="#L430"> 430</a> </span>
+<span class="source-line" id="L431"><a href="#L431"> 431</a>         if getattr(self.args, &quot;rollout_top_p&quot;, 1.0) != 1.0:</span>
+<span class="source-line" id="L432"><a href="#L432"> 432</a>             for sample in samples:</span>
+<span class="source-line" id="L433"><a href="#L433"> 433</a>                 assert sample.rollout_top_p_token_ids is not None</span>
+<span class="source-line" id="L434"><a href="#L434"> 434</a>                 assert sample.rollout_top_p_token_offsets is not None</span>
+<span class="source-line" id="L435"><a href="#L435"> 435</a>                 assert len(sample.rollout_top_p_token_offsets) == sample.response_length + 1, (</span>
+<span class="source-line" id="L436"><a href="#L436"> 436</a>                     f&quot;top-p token offsets length {len(sample.rollout_top_p_token_offsets)} &quot;</span>
+<span class="source-line" id="L437"><a href="#L437"> 437</a>                     f&quot;!= response length + 1 {sample.response_length + 1}&quot;</span>
+<span class="source-line" id="L438"><a href="#L438"> 438</a>                 )</span>
+<span class="source-line" id="L439"><a href="#L439"> 439</a>                 offset_end = int(sample.rollout_top_p_token_offsets[-1])</span>
+<span class="source-line" id="L440"><a href="#L440"> 440</a>                 assert offset_end == len(sample.rollout_top_p_token_ids), (</span>
+<span class="source-line" id="L441"><a href="#L441"> 441</a>                     f&quot;top-p token offsets[-1] {offset_end} &quot;</span>
+<span class="source-line" id="L442"><a href="#L442"> 442</a>                     f&quot;!= token ids length {len(sample.rollout_top_p_token_ids)}&quot;</span>
+<span class="source-line" id="L443"><a href="#L443"> 443</a>                 )</span>
+<span class="source-line" id="L444"><a href="#L444"> 444</a>             train_data[&quot;rollout_top_p_token_ids&quot;] = [sample.rollout_top_p_token_ids for sample in samples]</span>
+<span class="source-line" id="L445"><a href="#L445"> 445</a>             train_data[&quot;rollout_top_p_token_offsets&quot;] = [sample.rollout_top_p_token_offsets for sample in samples]</span>
+<span class="source-line" id="L446"><a href="#L446"> 446</a> </span>
+<span class="source-line" id="L447"><a href="#L447"> 447</a>         routed_experts_present = [sample.rollout_routed_experts is not None for sample in samples]</span>
+<span class="source-line" id="L448"><a href="#L448"> 448</a>         dead_sample_indices = {</span>
+<span class="source-line" id="L449"><a href="#L449"> 449</a>             idx</span>
+<span class="source-line" id="L450"><a href="#L450"> 450</a>             for idx, (present, sample) in enumerate(zip(routed_experts_present, samples, strict=True))</span>
+<span class="source-line" id="L451"><a href="#L451"> 451</a>             if not present and sample.loss_mask is not None and not any(sample.loss_mask)</span>
+<span class="source-line" id="L452"><a href="#L452"> 452</a>         }</span>
+<span class="source-line" id="L453"><a href="#L453"> 453</a>         live_missing = [</span>
+<span class="source-line" id="L454"><a href="#L454"> 454</a>             idx for idx, present in enumerate(routed_experts_present) if not present and idx not in dead_sample_indices</span>
+<span class="source-line" id="L455"><a href="#L455"> 455</a>         ]</span>
+<span class="source-line" id="L456"><a href="#L456"> 456</a>         routing_replay_enabled = getattr(self.args, &quot;use_rollout_routing_replay&quot;, False)</span>
+<span class="source-line" id="L457"><a href="#L457"> 457</a>         if live_missing and (routing_replay_enabled or any(routed_experts_present)):</span>
+<span class="source-line" id="L458"><a href="#L458"> 458</a>             raise ValueError(f&quot;Rollout routed experts are missing for live sample indices {live_missing[:32]}.&quot;)</span>
+<span class="source-line" id="L459"><a href="#L459"> 459</a> </span>
+<span class="source-line" id="L460"><a href="#L460"> 460</a>         if any(routed_experts_present) or (routing_replay_enabled and dead_sample_indices):</span>
+<span class="source-line" id="L461"><a href="#L461"> 461</a>             dtype = torch.uint8 if self.args.num_experts &lt;= 256 else torch.int32</span>
+<span class="source-line" id="L462"><a href="#L462"> 462</a>             routed_experts = [</span>
+<span class="source-line" id="L463"><a href="#L463"> 463</a>                 (</span>
+<span class="source-line" id="L464"><a href="#L464"> 464</a>                     (</span>
+<span class="source-line" id="L465"><a href="#L465"> 465</a>                         sample.rollout_routed_experts</span>
+<span class="source-line" id="L466"><a href="#L466"> 466</a>                         if isinstance(sample.rollout_routed_experts, DiskTensorRef)</span>
+<span class="source-line" id="L467"><a href="#L467"> 467</a>                         else sample.materialize_rollout_routed_experts()</span>
+<span class="source-line" id="L468"><a href="#L468"> 468</a>                     )</span>
+<span class="source-line" id="L469"><a href="#L469"> 469</a>                     if present</span>
+<span class="source-line" id="L470"><a href="#L470"> 470</a>                     else torch.zeros(</span>
+<span class="source-line" id="L471"><a href="#L471"> 471</a>                         (max(0, len(sample.tokens) - 1), self.args.num_layers, self.args.moe_router_topk),</span>
+<span class="source-line" id="L472"><a href="#L472"> 472</a>                         dtype=dtype,</span>
+<span class="source-line" id="L473"><a href="#L473"> 473</a>                     )</span>
+<span class="source-line" id="L474"><a href="#L474"> 474</a>                 )</span>
+<span class="source-line" id="L475"><a href="#L475"> 475</a>                 for sample, present in zip(samples, routed_experts_present, strict=True)</span>
+<span class="source-line" id="L476"><a href="#L476"> 476</a>             ]</span>
+<span class="source-line" id="L477"><a href="#L477"> 477</a>             if routing_replay_enabled and any(routed_experts_present):</span>
+<span class="source-line" id="L478"><a href="#L478"> 478</a>                 captured_pairs = [</span>
+<span class="source-line" id="L479"><a href="#L479"> 479</a>                     (experts, max(0, len(sample.tokens) - 1))</span>
+<span class="source-line" id="L480"><a href="#L480"> 480</a>                     for sample, experts, present in zip(samples, routed_experts, routed_experts_present, strict=True)</span>
+<span class="source-line" id="L481"><a href="#L481"> 481</a>                     if present</span>
+<span class="source-line" id="L482"><a href="#L482"> 482</a>                 ]</span>
+<span class="source-line" id="L483"><a href="#L483"> 483</a>                 validate_rollout_routed_experts_for_replay(</span>
+<span class="source-line" id="L484"><a href="#L484"> 484</a>                     [experts for experts, _ in captured_pairs],</span>
+<span class="source-line" id="L485"><a href="#L485"> 485</a>                     self.args,</span>
+<span class="source-line" id="L486"><a href="#L486"> 486</a>                     expected_rows=[rows for _, rows in captured_pairs],</span>
+<span class="source-line" id="L487"><a href="#L487"> 487</a>                 )</span>
+<span class="source-line" id="L488"><a href="#L488"> 488</a>             if dead_sample_indices:</span>
+<span class="source-line" id="L489"><a href="#L489"> 489</a>                 logger.warning(</span>
+<span class="source-line" id="L490"><a href="#L490"> 490</a>                     &quot;Using all-zero routed experts for %d fully loss-masked samples (indices %s).&quot;,</span>
+<span class="source-line" id="L491"><a href="#L491"> 491</a>                     len(dead_sample_indices),</span>
+<span class="source-line" id="L492"><a href="#L492"> 492</a>                     sorted(dead_sample_indices)[:16],</span>
+<span class="source-line" id="L493"><a href="#L493"> 493</a>                 )</span>
+<span class="source-line" id="L494"><a href="#L494"> 494</a>             train_data[&quot;rollout_routed_experts&quot;] = routed_experts</span>
+<span class="source-line" id="L495"><a href="#L495"> 495</a> </span>
+<span class="source-line" id="L496"><a href="#L496"> 496</a>         if samples[0].train_metadata is not None:</span>
+<span class="source-line" id="L497"><a href="#L497"> 497</a>             train_data[&quot;metadata&quot;] = [sample.train_metadata for sample in samples]</span>
+<span class="source-line" id="L498"><a href="#L498"> 498</a> </span>
+<span class="source-line" id="L499"><a href="#L499"> 499</a>         if any(sample.multimodal_train_inputs is not None for sample in samples):</span>
+<span class="source-line" id="L500"><a href="#L500"> 500</a>             train_data[&quot;multimodal_train_inputs&quot;] = [sample.multimodal_train_inputs for sample in samples]</span>
+<span class="source-line" id="L501"><a href="#L501"> 501</a> </span>
+<span class="source-line" id="L502"><a href="#L502"> 502</a>         if samples[0].teacher_log_probs is not None:</span>
+<span class="source-line" id="L503"><a href="#L503"> 503</a>             train_data[&quot;teacher_log_probs&quot;] = [sample.teacher_log_probs for sample in samples]</span>
+<span class="source-line" id="L504"><a href="#L504"> 504</a> </span>
+<span class="source-line" id="L505"><a href="#L505"> 505</a>         if samples[0].metadata is not None:</span>
+<span class="source-line" id="L506"><a href="#L506"> 506</a>             train_data[&quot;source_names&quot;] = [get_source(sample) for sample in samples]</span>
+<span class="source-line" id="L507"><a href="#L507"> 507</a> </span>
+<span class="source-line" id="L508"><a href="#L508"> 508</a>         return train_data</span>
+<span class="source-line" id="L509"><a href="#L509"> 509</a> </span>
+<span class="source-line" id="L510"><a href="#L510"> 510</a>     def set_train_parallel_config(self, config: dict):</span>
+<span class="source-line" id="L511"><a href="#L511"> 511</a>         self.train_parallel_config = config</span>
+<span class="source-line" id="L512"><a href="#L512"> 512</a> </span>
+<span class="source-line" id="L513"><a href="#L513"> 513</a>     def _split_train_data_by_dp(self, data):</span>
+<span class="source-line" id="L514"><a href="#L514"> 514</a>         &quot;&quot;&quot;Compute the DP/mbs schedule and package each rank&#x27;s rollout_data</span>
+<span class="source-line" id="L515"><a href="#L515"> 515</a>         into a Ray Box. The schedule itself is computed by</span>
+<span class="source-line" id="L516"><a href="#L516"> 516</a>         :func:`build_dp_schedule` so it stays unit-testable without Ray/sglang.</span>
+<span class="source-line" id="L517"><a href="#L517"> 517</a> </span>
+<span class="source-line" id="L518"><a href="#L518"> 518</a>         Step split is by rollout id (``samples[i].rollout_id``, falling back</span>
+<span class="source-line" id="L519"><a href="#L519"> 519</a>         to ``samples[i].index``); each step holds exactly</span>
+<span class="source-line" id="L520"><a href="#L520"> 520</a>         ``args.global_batch_size`` rollouts so the training-step count per</span>
+<span class="source-line" id="L521"><a href="#L521"> 521</a>         rollout is fixed at ``rollout_batch_size * n_samples_per_prompt //</span>
+<span class="source-line" id="L522"><a href="#L522"> 522</a>         global_batch_size`` regardless of how many training samples each</span>
+<span class="source-line" id="L523"><a href="#L523"> 523</a>         rollout produced.</span>
+<span class="source-line" id="L524"><a href="#L524"> 524</a>         &quot;&quot;&quot;</span>
+<span class="source-line" id="L525"><a href="#L525"> 525</a>         dp_size = self.train_parallel_config[&quot;dp_size&quot;]</span>
+<span class="source-line" id="L526"><a href="#L526"> 526</a>         total_lengths = [len(t) for t in data[&quot;tokens&quot;]]</span>
+<span class="source-line" id="L527"><a href="#L527"> 527</a>         data[&quot;total_lengths&quot;] = total_lengths</span>
+<span class="source-line" id="L528"><a href="#L528"> 528</a> </span>
+<span class="source-line" id="L529"><a href="#L529"> 529</a>         partitions, micro_batch_indices, num_microbatches, global_batch_sizes = build_dp_schedule(</span>
+<span class="source-line" id="L530"><a href="#L530"> 530</a>             self.args,</span>
+<span class="source-line" id="L531"><a href="#L531"> 531</a>             self.train_parallel_config,</span>
+<span class="source-line" id="L532"><a href="#L532"> 532</a>             total_lengths,</span>
+<span class="source-line" id="L533"><a href="#L533"> 533</a>             global_batch_size=self.args.global_batch_size,</span>
+<span class="source-line" id="L534"><a href="#L534"> 534</a>             rollout_indices=data[&quot;rollout_ids&quot;],</span>
+<span class="source-line" id="L535"><a href="#L535"> 535</a>         )</span>
+<span class="source-line" id="L536"><a href="#L536"> 536</a> </span>
+<span class="source-line" id="L537"><a href="#L537"> 537</a>         # Package per-rank rollout_data</span>
+<span class="source-line" id="L538"><a href="#L538"> 538</a>         rollout_data_refs = []</span>
+<span class="source-line" id="L539"><a href="#L539"> 539</a>         for r in range(dp_size):</span>
+<span class="source-line" id="L540"><a href="#L540"> 540</a>             partition = partitions[r]</span>
+<span class="source-line" id="L541"><a href="#L541"> 541</a>             rollout_data = {&quot;partition&quot;: partition}</span>
+<span class="source-line" id="L542"><a href="#L542"> 542</a>             for key in [</span>
+<span class="source-line" id="L543"><a href="#L543"> 543</a>                 &quot;tokens&quot;,</span>
+<span class="source-line" id="L544"><a href="#L544"> 544</a>                 &quot;multimodal_train_inputs&quot;,</span>
+<span class="source-line" id="L545"><a href="#L545"> 545</a>                 &quot;response_lengths&quot;,</span>
+<span class="source-line" id="L546"><a href="#L546"> 546</a>                 &quot;rewards&quot;,</span>
+<span class="source-line" id="L547"><a href="#L547"> 547</a>                 &quot;truncated&quot;,</span>
+<span class="source-line" id="L548"><a href="#L548"> 548</a>                 &quot;loss_masks&quot;,</span>
+<span class="source-line" id="L549"><a href="#L549"> 549</a>                 &quot;round_number&quot;,</span>
+<span class="source-line" id="L550"><a href="#L550"> 550</a>                 &quot;sample_indices&quot;,</span>
+<span class="source-line" id="L551"><a href="#L551"> 551</a>                 &quot;rollout_ids&quot;,</span>
+<span class="source-line" id="L552"><a href="#L552"> 552</a>                 &quot;rollout_mask_sums&quot;,</span>
+<span class="source-line" id="L553"><a href="#L553"> 553</a>                 &quot;rollout_log_probs&quot;,</span>
+<span class="source-line" id="L554"><a href="#L554"> 554</a>                 &quot;rollout_top_p_token_ids&quot;,</span>
+<span class="source-line" id="L555"><a href="#L555"> 555</a>                 &quot;rollout_top_p_token_offsets&quot;,</span>
+<span class="source-line" id="L556"><a href="#L556"> 556</a>                 &quot;rollout_routed_experts&quot;,</span>
+<span class="source-line" id="L557"><a href="#L557"> 557</a>                 &quot;source_names&quot;,</span>
+<span class="source-line" id="L558"><a href="#L558"> 558</a>                 &quot;prompt&quot;,</span>
+<span class="source-line" id="L559"><a href="#L559"> 559</a>                 &quot;teacher_log_probs&quot;,</span>
+<span class="source-line" id="L560"><a href="#L560"> 560</a>             ]:</span>
+<span class="source-line" id="L561"><a href="#L561"> 561</a>                 if key not in data:</span>
+<span class="source-line" id="L562"><a href="#L562"> 562</a>                     continue</span>
+<span class="source-line" id="L563"><a href="#L563"> 563</a>                 rollout_data[key] = [data[key][j] for j in partition]</span>
+<span class="source-line" id="L564"><a href="#L564"> 564</a>             # keys that need to be splited at train side</span>
+<span class="source-line" id="L565"><a href="#L565"> 565</a>             for key in [&quot;raw_reward&quot;, &quot;total_lengths&quot;]:</span>
+<span class="source-line" id="L566"><a href="#L566"> 566</a>                 if key not in data:</span>
+<span class="source-line" id="L567"><a href="#L567"> 567</a>                     continue</span>
+<span class="source-line" id="L568"><a href="#L568"> 568</a>                 rollout_data[key] = data[key]</span>
+<span class="source-line" id="L569"><a href="#L569"> 569</a>             rollout_data[&quot;global_batch_sizes&quot;] = global_batch_sizes</span>
+<span class="source-line" id="L570"><a href="#L570"> 570</a>             rollout_data[&quot;num_microbatches&quot;] = num_microbatches</span>
+<span class="source-line" id="L571"><a href="#L571"> 571</a>             rollout_data[&quot;micro_batch_indices&quot;] = micro_batch_indices[r]</span>
+<span class="source-line" id="L572"><a href="#L572"> 572</a>             tensorize_rollout_data_for_training(rollout_data)</span>
+<span class="source-line" id="L573"><a href="#L573"> 573</a>             transport = getattr(self.args, &quot;rollout_data_transport&quot;, &quot;object-store&quot;)</span>
+<span class="source-line" id="L574"><a href="#L574"> 574</a>             if transport == &quot;nixl&quot;:</span>
+<span class="source-line" id="L575"><a href="#L575"> 575</a>                 rollout_data_refs.append(Box(ray.put(rollout_data, _tensor_transport=&quot;nixl&quot;)))</span>
+<span class="source-line" id="L576"><a href="#L576"> 576</a>             elif transport == &quot;object-store&quot;:</span>
+<span class="source-line" id="L577"><a href="#L577"> 577</a>                 rollout_data_refs.append(Box(ray.put(rollout_data)))</span>
+<span class="source-line" id="L578"><a href="#L578"> 578</a>             else:</span>
+<span class="source-line" id="L579"><a href="#L579"> 579</a>                 raise ValueError(f&quot;Unsupported rollout data transport: {transport!r}&quot;)</span>
+<span class="source-line" id="L580"><a href="#L580"> 580</a>         return rollout_data_refs</span></code></pre></main></body></html>

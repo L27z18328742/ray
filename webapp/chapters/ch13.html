@@ -1,0 +1,99 @@
+<!doctype html><html lang="zh-Hans"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="description" content="从 Ray 入门到读懂 slime/ray：基于固定源码的中文交互教程。">
+<title>亲手做一个 CPU 版迷你 slime · Ray 与 slime 源码导读</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="stylesheet" href="../assets/tutorial.css"></head><body data-chapter="ch13" data-lab="">
+<a class="skip" href="#content">跳到正文</a>
+<header class="topbar"><a class="brand" href="../index.html">Ray 与 slime<span>源码导读</span></a>
+<nav class="chapnav"><a href="../index.html">全部章节</a><a href="sources.html">版本与证据</a></nav></header>
+<div class="layout"><aside class="sidebar"><nav class="toc" id="toc"><h2>本章目录</h2><details class="book-nav"><summary>全书章节</summary><a href="ch00.html">先看一轮训练怎样发生</a><a href="ch01.html">第一次 remote：任务与结果引用</a><a href="ch02.html">Actor：让模型留在一个进程里</a><a href="ch03.html">等待、依赖与背压</a><a href="ch04.html">先安排座位：Placement Group</a><a href="ch05.html">把训练 worker 一个个启动起来</a><a href="ch06.html">RolloutManager 如何组织生成</a><a href="ch07.html">一批数据如何到达训练 GPU</a><a href="ch08.html">读通 train.py 的一整个循环</a><a href="ch09.html">训练完，推理模型怎么拿到新权重</a><a href="ch10.html">同卡部署、卸载与进程释放</a><a href="ch11.html">真正的异步发生在哪里</a><a href="ch12.html">卡住与失败时，沿边界排查</a><a href="ch13.html" aria-current="page">亲手做一个 CPU 版迷你 slime</a><a href="glossary.html">术语与对象速查</a><a href="practice.html">理解题与源码寻路任务</a><a href="sources.html">版本、证据与源码索引</a></details></nav></aside>
+<main class="main"><p class="chapter-meta">分支与实战 / 第 13 章 · 约 40 分钟 · 已展开</p>
+<details class="mobile-nav"><summary>选择章节</summary><a href="ch00.html">先看一轮训练怎样发生</a><a href="ch01.html">第一次 remote：任务与结果引用</a><a href="ch02.html">Actor：让模型留在一个进程里</a><a href="ch03.html">等待、依赖与背压</a><a href="ch04.html">先安排座位：Placement Group</a><a href="ch05.html">把训练 worker 一个个启动起来</a><a href="ch06.html">RolloutManager 如何组织生成</a><a href="ch07.html">一批数据如何到达训练 GPU</a><a href="ch08.html">读通 train.py 的一整个循环</a><a href="ch09.html">训练完，推理模型怎么拿到新权重</a><a href="ch10.html">同卡部署、卸载与进程释放</a><a href="ch11.html">真正的异步发生在哪里</a><a href="ch12.html">卡住与失败时，沿边界排查</a><a href="ch13.html" aria-current="page">亲手做一个 CPU 版迷你 slime</a><a href="glossary.html">术语与对象速查</a><a href="practice.html">理解题与源码寻路任务</a><a href="sources.html">版本、证据与源码索引</a></details><div id="lab-banner"></div>
+<article id="content" class="prose"></article><noscript>请启用 JavaScript 阅读网页，或直接查看 content 中的 Markdown。</noscript>
+<section id="lab" class="lab" hidden><h2 class="lab-title"></h2><p class="lab-intro"></p><div id="lab-root"></div></section>
+<div class="study-actions"><button id="mark-read" type="button">标记为已读</button><span id="read-status" role="status"></span></div>
+<nav class="pager"><a class="prev" href="ch12.html"><span class="dir">← 上一章</span><div class="ttl">卡住与失败时，沿边界排查</div></a><a class="next" href="glossary.html"><span class="dir">下一章 →</span><div class="ttl">术语与对象速查</div></a></nav><footer class="pagefoot">独立中文源码教程 · slime 5bae5bb7928d · 源码事实、教学简化与实验结果分别标注。<br>视觉样式参考 Ultra-Scale Playbook 中文版；署名见 <a href="sources.html">来源与许可</a>。</footer>
+</main></div><script type="text/markdown" id="chapter-md"># 亲手做一个 CPU 版迷你 slime
+
+> 阅读目标：在无需模型和 GPU 的情况下，把资源、Actor、数据引用和权重版本串成一轮可检查的流程。状态：已展开。
+
+## 这个实验验证什么
+
+这是我们为教程编写的 **Ray 编排教学模型**。它不用 Megatron、SGLang、PyTorch、NCCL，也不会训练语言模型。它用整数模拟模型版本，用短列表模拟 batch，让你清楚观察引用和状态何时变化。
+
+真实源码中的训练 worker 会依靠 collective 保持模型一致；本实验里各训练 Actor 独立维护相同的版本计数，仅模拟同步屏障。不要把它的正确运行当成 GPU 通信或 slime 可部署性的证据。
+
+## 准备独立环境
+
+站点构建只依赖 Python 标准库。CPU 实验使用 **Python 3.12 与 Ray 2.49.2**，这是教程实验的固定版本；slime 的 requirements 本身没有把 Ray 精确锁定到该版本。下面在教程目录创建局部虚拟环境：
+
+```bash
+cd /Users/lezewei/project/study/blog/ray
+uv venv --python 3.12 .venv
+uv pip install --python .venv/bin/python -r examples/requirements.txt
+.venv/bin/python examples/01_tasks.py
+```
+
+如果本目录已有 `.venv`，不必重新创建；可先运行 `.venv/bin/python -c 'import ray; print(ray.__version__)'`检查。没有 uv 时，也可用已有 Python 3.12 的 `python3.12 -m venv .venv`和 `.venv/bin/python -m pip install -r examples/requirements.txt`。
+
+脚本显式使用 `address="local"`启动独立本地 Ray，避免意外连接你的训练集群。每个脚本结束时会清理自己启动的资源。实验需要至少可供声明的少量 CPU 资源与本地内存；不需要 Ray 集群或 CUDA。
+
+## 六个实验，按顺序运行
+
+| 文件 | 操作 | 成功时应观察到什么 |
+|---|---|---|
+| [01_tasks.py](../examples/01_tasks.py) | 提交平方任务，获取结果 | ObjectRef；返回 4、9；worker PID 与 driver 不同 |
+| [02_actors.py](../examples/02_actors.py) | 在两个 Counter 上调用方法 | 同一 Counter 累加到 5，另一实例保持独立 |
+| [03_objects.py](../examples/03_objects.py) | 顶层引用依赖、Box 包装与按分片取数 | 顶层参数收到值；Box 内仍是 ObjectRef |
+| [04_placement.py](../examples/04_placement.py) | 两 CPU bundle 就绪；再申请超过本地容量的 PG | 小组成功；大组在限时 wait 内未就绪，随后被移除 |
+| [05_mini_slime.py](../examples/05_mini_slime.py) | 生成 → DP 取数 → 训练屏障 → 同步版本 | 连续三轮的 serving / train 版本按预期递增 |
+| [06_backpressure.py](../examples/06_backpressure.py) | 有上限地提交任务、逐批消费 | 所有结果完整，记录的 pending 峰值不超过设定上限 |
+
+可以逐个执行，例如：
+
+```bash
+.venv/bin/python examples/04_placement.py
+.venv/bin/python examples/05_mini_slime.py
+.venv/bin/python examples/06_backpressure.py
+```
+
+PID、启动耗时和任务完成顺序每次都可能变化。脚本验证不依赖固定 PID 或“必须加速几倍”；它检查值、引用类型、分片与版本顺序等关键性质。
+
+## mini slime 的主链
+
+**预留两个 CPU bundles → 创建两个训练 Actor 和一个 manager → 初次版本同步 → manager 生成两个数据分片 → driver 拿到 Box 列表 → worker 按 rank 获取对应分片 → 等两个训练调用完成 → 更新 manager 版本 → 下一轮**。
+
+| 教学对象 | 对应的 slime 角色 | 被省略的实现 |
+|---|---|---|
+| 普通 Python 主程序 | `train.py` driver | 参数系统、保存与 evaluation |
+| `TrainGroup` | `RayTrainGroup` | 多节点 rank/master 初始化 |
+| `Trainer` Actor | `MegatronTrainRayActor` | tensor、梯度、optimizer、collective |
+| `Manager` Actor | `RolloutManager`与推理侧状态的简化合体 | HTTP、SGLang server、reward |
+| `Box(ray.put(shard))` | 默认 rollout 数据路径 | 长度均衡与真实 tensor |
+| `set_version` | 推理侧拿到新权重的完成点 | 权重转换与传输协议 |
+
+输出中的 `serving=0 → trained=[1,1] → synced=1`表示第一轮用版本 0 生成，两个 worker 都训练至版本 1，再把版本 1 同步给生成侧。它不是 slime 自带日志格式。
+
+## 三个小改动，检验你是否理解
+
+1. 注释掉每轮末尾的 `set_version`同步，保留脚本中的版本断言。预测哪一轮会报错，解释为什么 GPU 再多也无法修复这个状态问题。
+2. 在 `Trainer.train`里打印实际取到的数据片。两个 worker 是否取到了不同分片？把选片 rank 改成常量 0，会在哪个断言被发现？
+3. 把 `TrainGroup.async_train`改成每提交一个就 get，再让某个 worker 人为变慢。画出新旧时间线。这里用 `sleep`只能演示等待结构，不能模拟真实 GPU 性能。
+
+修改前可以复制实验文件保留原版。实验退出后若发现未结束的本地 Ray 进程，先确认它属于本次本地 session；不要对共用训练机器直接执行无差别 stop / kill。
+
+## 回到真实源码做最后一次对照
+
+1. 打开 [train.py](../source/train.py.html#L9)，用教学程序标出 driver 的等待点。
+2. 打开 [RayTrainGroup.async_train](../source/slime/ray/actor_group.py.html#L131)，确认提交所有 worker 的方式。
+3. 打开 [RolloutManager._split_train_data_by_dp](../source/slime/ray/rollout.py.html#L513)，确认 Box 的生产位置。
+4. 打开 [process_rollout_data](../source/slime/utils/data.py.html#L304)，确认真正取数的位置。
+5. 打开[权重更新选择器](../source/slime/backends/megatron_utils/update_weight/__init__.py.html#L10)，说出真实系统比 `set_version`多出的工作。
+
+实际运行环境、退出码和结果记录统一保存在 [验证与来源](sources.html)。下一步上 GPU 前，还需要独立准备模型、数据、后端依赖、网络与资源配置；这些不包含在本 CPU 模型的验证范围里。
+
+**结课任务：不看图，口述一批数据从 driver 发出 generate 命令，到下一轮推理使用新权重的全过程。至少标出三个进程边界、两次 get，以及一个不由 Ray 执行的计算或通信操作。**
+</script>
+<script src="../assets/marked.min.js"></script><script src="../assets/app.js"></script><script src="../assets/labs.js"></script></body></html>

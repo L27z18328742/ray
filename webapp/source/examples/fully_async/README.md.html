@@ -1,0 +1,91 @@
+<!doctype html><html lang="zh-Hans"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="description" content="从 Ray 入门到读懂 slime/ray：基于固定源码的中文交互教程。">
+<title>examples/fully_async/README.md · Ray 与 slime 源码导读</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="../../../assets/style.css">
+<link rel="stylesheet" href="../../../assets/tutorial.css"></head><body class="source-page"><header class="topbar">
+<a class="brand" href="../../../index.html">Ray 与 slime</a><a href="https://github.com/THUDM/slime/blob/5bae5bb7928d65906e24e99f5b5d3f99a4daaf93/examples/fully_async/README.md">GitHub 固定版本 ↗</a></header>
+<main class="source-wrap"><p><a href="../../../chapters/sources.html">← 源码索引</a> · 5bae5bb7928d · 只读快照</p>
+<h1>examples/fully_async/README.md</h1><pre class="source-code"><code><span class="source-line" id="L1"><a href="#L1">   1</a> # Fully-Async Rollout Example</span>
+<span class="source-line" id="L2"><a href="#L2">   2</a> </span>
+<span class="source-line" id="L3"><a href="#L3">   3</a> End-to-end demo of slime&#x27;s fully-async rollout path. A background asyncio</span>
+<span class="source-line" id="L4"><a href="#L4">   4</a> worker keeps a fixed pool of in-flight generations across rollout boundaries,</span>
+<span class="source-line" id="L5"><a href="#L5">   5</a> so the next training step doesn&#x27;t wait for the slowest in-flight sample.</span>
+<span class="source-line" id="L6"><a href="#L6">   6</a> The worker itself lives in `slime.rollout.fully_async_rollout`; this</span>
+<span class="source-line" id="L7"><a href="#L7">   7</a> directory is just the launch script + CI test.</span>
+<span class="source-line" id="L8"><a href="#L8">   8</a> </span>
+<span class="source-line" id="L9"><a href="#L9">   9</a> ## Files</span>
+<span class="source-line" id="L10"><a href="#L10">  10</a> </span>
+<span class="source-line" id="L11"><a href="#L11">  11</a> * `run-qwen2.5-0.5B-fully_async.sh` — single-node, 4-GPU, three-rollout demo</span>
+<span class="source-line" id="L12"><a href="#L12">  12</a>   with Qwen2.5-0.5B-Instruct on dapo-math-17k. Fast enough to be the CI</span>
+<span class="source-line" id="L13"><a href="#L13">  13</a>   smoke test for the fully-async path.</span>
+<span class="source-line" id="L14"><a href="#L14">  14</a> * `run-qwen3.5-9B-fully_async.sh` — single-node, 8-GPU, three-rollout demo</span>
+<span class="source-line" id="L15"><a href="#L15">  15</a>   with Qwen3.5-9B on dapo-math-17k.</span>
+<span class="source-line" id="L16"><a href="#L16">  16</a> </span>
+<span class="source-line" id="L17"><a href="#L17">  17</a> The same script doubles as `tests/test_qwen2.5_0.5B_fully_async_short.py` in</span>
+<span class="source-line" id="L18"><a href="#L18">  18</a> CI.</span>
+<span class="source-line" id="L19"><a href="#L19">  19</a> </span>
+<span class="source-line" id="L20"><a href="#L20">  20</a> ## Prerequisites</span>
+<span class="source-line" id="L21"><a href="#L21">  21</a> </span>
+<span class="source-line" id="L22"><a href="#L22">  22</a> ```</span>
+<span class="source-line" id="L23"><a href="#L23">  23</a> /root/models/Qwen2.5-0.5B-Instruct/            # HF checkpoint</span>
+<span class="source-line" id="L24"><a href="#L24">  24</a> /root/models/Qwen2.5-0.5B-Instruct_torch_dist/ # tools/convert_hf_to_torch_dist.py</span>
+<span class="source-line" id="L25"><a href="#L25">  25</a> /root/datasets/dapo-math-17k/dapo-math-17k.jsonl</span>
+<span class="source-line" id="L26"><a href="#L26">  26</a> ```</span>
+<span class="source-line" id="L27"><a href="#L27">  27</a> </span>
+<span class="source-line" id="L28"><a href="#L28">  28</a> ## Run</span>
+<span class="source-line" id="L29"><a href="#L29">  29</a> </span>
+<span class="source-line" id="L30"><a href="#L30">  30</a> ```bash</span>
+<span class="source-line" id="L31"><a href="#L31">  31</a> cd slime</span>
+<span class="source-line" id="L32"><a href="#L32">  32</a> bash examples/fully_async/run-qwen2.5-0.5B-fully_async.sh</span>
+<span class="source-line" id="L33"><a href="#L33">  33</a> ```</span>
+<span class="source-line" id="L34"><a href="#L34">  34</a> </span>
+<span class="source-line" id="L35"><a href="#L35">  35</a> You should see:</span>
+<span class="source-line" id="L36"><a href="#L36">  36</a> </span>
+<span class="source-line" id="L37"><a href="#L37">  37</a> ```</span>
+<span class="source-line" id="L38"><a href="#L38">  38</a> fully-async rollout 0: target=8 queue_warm=0</span>
+<span class="source-line" id="L39"><a href="#L39">  39</a> fully-async rollout 0: done in ...s, queue_left=...</span>
+<span class="source-line" id="L40"><a href="#L40">  40</a> ```</span>
+<span class="source-line" id="L41"><a href="#L41">  41</a> </span>
+<span class="source-line" id="L42"><a href="#L42">  42</a> ## How To Plug Your Own Generate Into This</span>
+<span class="source-line" id="L43"><a href="#L43">  43</a> </span>
+<span class="source-line" id="L44"><a href="#L44">  44</a> Fully-async uses the standard `python3 train.py` entrypoint. Select the</span>
+<span class="source-line" id="L45"><a href="#L45">  45</a> rollout implementation with:</span>
+<span class="source-line" id="L46"><a href="#L46">  46</a> </span>
+<span class="source-line" id="L47"><a href="#L47">  47</a> ```</span>
+<span class="source-line" id="L48"><a href="#L48">  48</a> --rollout-function-path slime.rollout.fully_async_rollout.generate_rollout_fully_async</span>
+<span class="source-line" id="L49"><a href="#L49">  49</a> ```</span>
+<span class="source-line" id="L50"><a href="#L50">  50</a> </span>
+<span class="source-line" id="L51"><a href="#L51">  51</a> For custom per-sample logic, use slime&#x27;s standard plug-in points — they</span>
+<span class="source-line" id="L52"><a href="#L52">  52</a> work unchanged under fully-async:</span>
+<span class="source-line" id="L53"><a href="#L53">  53</a> </span>
+<span class="source-line" id="L54"><a href="#L54">  54</a> ```</span>
+<span class="source-line" id="L55"><a href="#L55">  55</a> --custom-generate-function-path your.module.generate     # (args, sample, sampling_params) -&gt; Sample | list[Sample]</span>
+<span class="source-line" id="L56"><a href="#L56">  56</a> --custom-rm-path                your.module.reward      # (args, sample | list[Sample]) -&gt; float | list[float]</span>
+<span class="source-line" id="L57"><a href="#L57">  57</a> ```</span>
+<span class="source-line" id="L58"><a href="#L58">  58</a> </span>
+<span class="source-line" id="L59"><a href="#L59">  59</a> See `examples/coding_agent_rl/` for a non-trivial example that plugs in a</span>
+<span class="source-line" id="L60"><a href="#L60">  60</a> multi-turn agent (Claude Code in a Docker-Proxy sandbox) this way.</span>
+<span class="source-line" id="L61"><a href="#L61">  61</a> </span>
+<span class="source-line" id="L62"><a href="#L62">  62</a> ## Worker Internals (Very Short)</span>
+<span class="source-line" id="L63"><a href="#L63">  63</a> </span>
+<span class="source-line" id="L64"><a href="#L64">  64</a> * First call: create a process-wide `AsyncRolloutWorker` (thread + asyncio</span>
+<span class="source-line" id="L65"><a href="#L65">  65</a>   loop). The worker is shared across all subsequent `generate_rollout`</span>
+<span class="source-line" id="L66"><a href="#L66">  66</a>   calls so its queue stays warm.</span>
+<span class="source-line" id="L67"><a href="#L67">  67</a> * Loop keeps up to `args.sglang_server_concurrency` tasks in flight using</span>
+<span class="source-line" id="L68"><a href="#L68">  68</a>   `generate_and_rm_group`.</span>
+<span class="source-line" id="L69"><a href="#L69">  69</a> * Completed groups land on an output queue; each `generate_rollout` call</span>
+<span class="source-line" id="L70"><a href="#L70">  70</a>   drains until it has `rollout_batch_size` groups and returns them sorted</span>
+<span class="source-line" id="L71"><a href="#L71">  71</a>   by `sample.index`.</span>
+<span class="source-line" id="L72"><a href="#L72">  72</a> * Groups containing an `ABORTED` sample are pushed back into</span>
+<span class="source-line" id="L73"><a href="#L73">  73</a>   `data_buffer.add_samples` instead of being shipped to training.</span>
+<span class="source-line" id="L74"><a href="#L74">  74</a> * Worker is stopped automatically at process exit via `atexit`.</span>
+<span class="source-line" id="L75"><a href="#L75">  75</a> </span>
+<span class="source-line" id="L76"><a href="#L76">  76</a> ## Limitations</span>
+<span class="source-line" id="L77"><a href="#L77">  77</a> </span>
+<span class="source-line" id="L78"><a href="#L78">  78</a> * No evaluation mode (would conflict with the continuous-running model).</span>
+<span class="source-line" id="L79"><a href="#L79">  79</a> * Ordering across rollouts is best-effort — within a rollout, groups are</span>
+<span class="source-line" id="L80"><a href="#L80">  80</a>   sorted by index before being handed to training.</span>
+<span class="source-line" id="L81"><a href="#L81">  81</a> * TODO: partial-rollout-style resume for `ABORTED` trajectories is not</span>
+<span class="source-line" id="L82"><a href="#L82">  82</a>   yet wired; for now the trajectory is re-queued and starts over.</span></code></pre></main></body></html>

@@ -1,0 +1,236 @@
+<!doctype html><html lang="zh-Hans"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="description" content="从 Ray 入门到读懂 slime/ray：基于固定源码的中文交互教程。">
+<title>slime/backends/megatron_utils/data.py · Ray 与 slime 源码导读</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="../../../../assets/style.css">
+<link rel="stylesheet" href="../../../../assets/tutorial.css"></head><body class="source-page"><header class="topbar">
+<a class="brand" href="../../../../index.html">Ray 与 slime</a><a href="https://github.com/THUDM/slime/blob/5bae5bb7928d65906e24e99f5b5d3f99a4daaf93/slime/backends/megatron_utils/data.py">GitHub 固定版本 ↗</a></header>
+<main class="source-wrap"><p><a href="../../../../chapters/sources.html">← 源码索引</a> · 5bae5bb7928d · 只读快照</p>
+<h1>slime/backends/megatron_utils/data.py</h1><pre class="source-code"><code><span class="source-line" id="L1"><a href="#L1">   1</a> from collections.abc import Sequence</span>
+<span class="source-line" id="L2"><a href="#L2">   2</a> </span>
+<span class="source-line" id="L3"><a href="#L3">   3</a> import torch</span>
+<span class="source-line" id="L4"><a href="#L4">   4</a> import torch.nn.functional as F</span>
+<span class="source-line" id="L5"><a href="#L5">   5</a> from megatron.core import mpu</span>
+<span class="source-line" id="L6"><a href="#L6">   6</a> from megatron.core.packed_seq_params import PackedSeqParams</span>
+<span class="source-line" id="L7"><a href="#L7">   7</a> </span>
+<span class="source-line" id="L8"><a href="#L8">   8</a> from slime.utils import accelerator</span>
+<span class="source-line" id="L9"><a href="#L9">   9</a> from slime.utils.types import RolloutBatch</span>
+<span class="source-line" id="L10"><a href="#L10">  10</a> </span>
+<span class="source-line" id="L11"><a href="#L11">  11</a> from .cp_utils import slice_with_cp</span>
+<span class="source-line" id="L12"><a href="#L12">  12</a> </span>
+<span class="source-line" id="L13"><a href="#L13">  13</a> </span>
+<span class="source-line" id="L14"><a href="#L14">  14</a> def get_batch(</span>
+<span class="source-line" id="L15"><a href="#L15">  15</a>     data_iterator: &quot;DataIterator&quot;,</span>
+<span class="source-line" id="L16"><a href="#L16">  16</a>     keys: Sequence[str],</span>
+<span class="source-line" id="L17"><a href="#L17">  17</a>     pad_multiplier: int = 128,</span>
+<span class="source-line" id="L18"><a href="#L18">  18</a>     allgather_cp: bool = False,</span>
+<span class="source-line" id="L19"><a href="#L19">  19</a> ) -&gt; dict[str, torch.Tensor | PackedSeqParams | list[torch.Tensor] | None]:</span>
+<span class="source-line" id="L20"><a href="#L20">  20</a>     &quot;&quot;&quot;</span>
+<span class="source-line" id="L21"><a href="#L21">  21</a>     Generate a CP-ready micro-batch with packed sequence parameters.</span>
+<span class="source-line" id="L22"><a href="#L22">  22</a> </span>
+<span class="source-line" id="L23"><a href="#L23">  23</a>     Steps:</span>
+<span class="source-line" id="L24"><a href="#L24">  24</a>     - Fetch raw fields via iterator.</span>
+<span class="source-line" id="L25"><a href="#L25">  25</a>     - Save original token tensors under &quot;unconcat_tokens&quot;.</span>
+<span class="source-line" id="L26"><a href="#L26">  26</a>     - Slice tokens into two chunks for Context Parallelism (CP), concatenate, and pad to a configurable multiple.</span>
+<span class="source-line" id="L27"><a href="#L27">  27</a>     - Build cu_seqlens and `PackedSeqParams` with T-H-D layout (T: sequence length, H: attention heads, D: head dimension).</span>
+<span class="source-line" id="L28"><a href="#L28">  28</a> </span>
+<span class="source-line" id="L29"><a href="#L29">  29</a>     Args:</span>
+<span class="source-line" id="L30"><a href="#L30">  30</a>         data_iterator: Iterator providing micro-batch data.</span>
+<span class="source-line" id="L31"><a href="#L31">  31</a>         keys: List of keys to fetch from the iterator.</span>
+<span class="source-line" id="L32"><a href="#L32">  32</a>         pad_multiplier: Multiplier for padding size calculation (default: 128).</span>
+<span class="source-line" id="L33"><a href="#L33">  33</a> </span>
+<span class="source-line" id="L34"><a href="#L34">  34</a>     Returns a dict including:</span>
+<span class="source-line" id="L35"><a href="#L35">  35</a>     - &quot;tokens&quot;: torch.LongTensor of shape [1, T_padded] on the current CUDA device</span>
+<span class="source-line" id="L36"><a href="#L36">  36</a>     - &quot;unconcat_tokens&quot;: list[torch.LongTensor] for the micro-batch before CP slicing/concat</span>
+<span class="source-line" id="L37"><a href="#L37">  37</a>     - &quot;packed_seq_params&quot;: PackedSeqParams with T-H-D settings (cu_seqlens on CUDA, dtype=int)</span>
+<span class="source-line" id="L38"><a href="#L38">  38</a>     Plus any other requested keys forwarded from the iterator.</span>
+<span class="source-line" id="L39"><a href="#L39">  39</a>     &quot;&quot;&quot;</span>
+<span class="source-line" id="L40"><a href="#L40">  40</a> </span>
+<span class="source-line" id="L41"><a href="#L41">  41</a>     assert &quot;tokens&quot; in keys</span>
+<span class="source-line" id="L42"><a href="#L42">  42</a>     batch = data_iterator.get_next(keys)</span>
+<span class="source-line" id="L43"><a href="#L43">  43</a> </span>
+<span class="source-line" id="L44"><a href="#L44">  44</a>     tokens = batch[&quot;tokens&quot;]</span>
+<span class="source-line" id="L45"><a href="#L45">  45</a>     # use 0 as the pad token id should be fine?</span>
+<span class="source-line" id="L46"><a href="#L46">  46</a>     pad_token_id = 0</span>
+<span class="source-line" id="L47"><a href="#L47">  47</a>     pad_size = mpu.get_tensor_model_parallel_world_size() * pad_multiplier</span>
+<span class="source-line" id="L48"><a href="#L48">  48</a> </span>
+<span class="source-line" id="L49"><a href="#L49">  49</a>     # for cp, we need all tokens to calculate logprob</span>
+<span class="source-line" id="L50"><a href="#L50">  50</a>     batch[&quot;unconcat_tokens&quot;] = tokens</span>
+<span class="source-line" id="L51"><a href="#L51">  51</a> </span>
+<span class="source-line" id="L52"><a href="#L52">  52</a>     cp_size = mpu.get_context_parallel_world_size()</span>
+<span class="source-line" id="L53"><a href="#L53">  53</a>     cp_rank = mpu.get_context_parallel_rank()</span>
+<span class="source-line" id="L54"><a href="#L54">  54</a> </span>
+<span class="source-line" id="L55"><a href="#L55">  55</a>     if allgather_cp:</span>
+<span class="source-line" id="L56"><a href="#L56">  56</a>         # DSA mode: concatenate all sequences first, then slice once with CP.</span>
+<span class="source-line" id="L57"><a href="#L57">  57</a>         # We also pad the *global* concatenated stream to make per-rank chunks equal.</span>
+<span class="source-line" id="L58"><a href="#L58">  58</a>         cu_seqlens_list: list[int] = [0]</span>
+<span class="source-line" id="L59"><a href="#L59">  59</a>         for t in tokens:</span>
+<span class="source-line" id="L60"><a href="#L60">  60</a>             cu_seqlens_list.append(cu_seqlens_list[-1] + t.size(0))</span>
+<span class="source-line" id="L61"><a href="#L61">  61</a> </span>
+<span class="source-line" id="L62"><a href="#L62">  62</a>         tokens = torch.cat(tokens, dim=0)</span>
+<span class="source-line" id="L63"><a href="#L63">  63</a> </span>
+<span class="source-line" id="L64"><a href="#L64">  64</a>         # Pad global stream so (1) divisible by cp_size (equal chunks),</span>
+<span class="source-line" id="L65"><a href="#L65">  65</a>         # (2) divisible by pad_size (reduce fragmentation).</span>
+<span class="source-line" id="L66"><a href="#L66">  66</a>         global_pad_size = cp_size * pad_size</span>
+<span class="source-line" id="L67"><a href="#L67">  67</a>         pad = (global_pad_size - tokens.size(0) % global_pad_size) % global_pad_size</span>
+<span class="source-line" id="L68"><a href="#L68">  68</a>         if pad != 0:</span>
+<span class="source-line" id="L69"><a href="#L69">  69</a>             tokens = F.pad(tokens, (0, pad), value=pad_token_id)</span>
+<span class="source-line" id="L70"><a href="#L70">  70</a>             cu_seqlens_list.append(cu_seqlens_list[-1] + pad)</span>
+<span class="source-line" id="L71"><a href="#L71">  71</a> </span>
+<span class="source-line" id="L72"><a href="#L72">  72</a>         cu_seqlens = torch.tensor(cu_seqlens_list, dtype=torch.int, device=accelerator.current_device())</span>
+<span class="source-line" id="L73"><a href="#L73">  73</a>         tokens = tokens.chunk(cp_size, dim=0)[cp_rank]</span>
+<span class="source-line" id="L74"><a href="#L74">  74</a>     else:</span>
+<span class="source-line" id="L75"><a href="#L75">  75</a>         tokens = [slice_with_cp(t, pad_token_id) for t in tokens]</span>
+<span class="source-line" id="L76"><a href="#L76">  76</a> </span>
+<span class="source-line" id="L77"><a href="#L77">  77</a>         cu_seqlens = [0]</span>
+<span class="source-line" id="L78"><a href="#L78">  78</a>         for t in tokens:</span>
+<span class="source-line" id="L79"><a href="#L79">  79</a>             cu_seqlens.append(cu_seqlens[-1] + t.size(0))</span>
+<span class="source-line" id="L80"><a href="#L80">  80</a> </span>
+<span class="source-line" id="L81"><a href="#L81">  81</a>         tokens = torch.cat(tokens)</span>
+<span class="source-line" id="L82"><a href="#L82">  82</a> </span>
+<span class="source-line" id="L83"><a href="#L83">  83</a>         # Always pad to reduce memory fragmentation and maybe make the computation faster</span>
+<span class="source-line" id="L84"><a href="#L84">  84</a>         pad = (pad_size - tokens.size(0) % pad_size) % pad_size</span>
+<span class="source-line" id="L85"><a href="#L85">  85</a>         if pad != 0:</span>
+<span class="source-line" id="L86"><a href="#L86">  86</a>             tokens = F.pad(tokens, (0, pad), value=pad_token_id)</span>
+<span class="source-line" id="L87"><a href="#L87">  87</a>             cu_seqlens.append(cu_seqlens[-1] + pad)</span>
+<span class="source-line" id="L88"><a href="#L88">  88</a> </span>
+<span class="source-line" id="L89"><a href="#L89">  89</a>         # thd requires the cu_seqlens to be of the origin length</span>
+<span class="source-line" id="L90"><a href="#L90">  90</a>         cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int, device=accelerator.device()) * cp_size</span>
+<span class="source-line" id="L91"><a href="#L91">  91</a> </span>
+<span class="source-line" id="L92"><a href="#L92">  92</a>     max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()</span>
+<span class="source-line" id="L93"><a href="#L93">  93</a>     packed_seq_params = PackedSeqParams(</span>
+<span class="source-line" id="L94"><a href="#L94">  94</a>         cu_seqlens_q=cu_seqlens,</span>
+<span class="source-line" id="L95"><a href="#L95">  95</a>         cu_seqlens_kv=cu_seqlens,</span>
+<span class="source-line" id="L96"><a href="#L96">  96</a>         max_seqlen_q=max_seqlen,</span>
+<span class="source-line" id="L97"><a href="#L97">  97</a>         max_seqlen_kv=max_seqlen,</span>
+<span class="source-line" id="L98"><a href="#L98">  98</a>         qkv_format=&quot;thd&quot;,</span>
+<span class="source-line" id="L99"><a href="#L99">  99</a>     )</span>
+<span class="source-line" id="L100"><a href="#L100"> 100</a> </span>
+<span class="source-line" id="L101"><a href="#L101"> 101</a>     tokens = tokens.unsqueeze(0)</span>
+<span class="source-line" id="L102"><a href="#L102"> 102</a> </span>
+<span class="source-line" id="L103"><a href="#L103"> 103</a>     batch[&quot;tokens&quot;] = tokens</span>
+<span class="source-line" id="L104"><a href="#L104"> 104</a>     batch[&quot;packed_seq_params&quot;] = packed_seq_params</span>
+<span class="source-line" id="L105"><a href="#L105"> 105</a> </span>
+<span class="source-line" id="L106"><a href="#L106"> 106</a>     # loss masks</span>
+<span class="source-line" id="L107"><a href="#L107"> 107</a>     loss_masks = []</span>
+<span class="source-line" id="L108"><a href="#L108"> 108</a>     for loss_mask, total_length, response_length in zip(</span>
+<span class="source-line" id="L109"><a href="#L109"> 109</a>         batch[&quot;loss_masks&quot;],</span>
+<span class="source-line" id="L110"><a href="#L110"> 110</a>         batch[&quot;total_lengths&quot;],</span>
+<span class="source-line" id="L111"><a href="#L111"> 111</a>         batch[&quot;response_lengths&quot;],</span>
+<span class="source-line" id="L112"><a href="#L112"> 112</a>         strict=True,</span>
+<span class="source-line" id="L113"><a href="#L113"> 113</a>     ):</span>
+<span class="source-line" id="L114"><a href="#L114"> 114</a>         prompt_length = total_length - response_length</span>
+<span class="source-line" id="L115"><a href="#L115"> 115</a>         # Align mask to token stream positions (prompt_length-1 left pad, 1 right pad)</span>
+<span class="source-line" id="L116"><a href="#L116"> 116</a>         loss_mask = F.pad(loss_mask, (prompt_length - 1, 1), value=0)</span>
+<span class="source-line" id="L117"><a href="#L117"> 117</a>         if allgather_cp:</span>
+<span class="source-line" id="L118"><a href="#L118"> 118</a>             loss_masks.append(loss_mask)</span>
+<span class="source-line" id="L119"><a href="#L119"> 119</a>             continue</span>
+<span class="source-line" id="L120"><a href="#L120"> 120</a>         loss_mask = slice_with_cp(loss_mask, 0)</span>
+<span class="source-line" id="L121"><a href="#L121"> 121</a>         loss_masks.append(loss_mask)</span>
+<span class="source-line" id="L122"><a href="#L122"> 122</a> </span>
+<span class="source-line" id="L123"><a href="#L123"> 123</a>     if allgather_cp:</span>
+<span class="source-line" id="L124"><a href="#L124"> 124</a>         # DSA: concatenate first (same as tokens), pad globally (same pad as above), then slice once.</span>
+<span class="source-line" id="L125"><a href="#L125"> 125</a>         loss_masks = torch.cat(loss_masks, dim=0)</span>
+<span class="source-line" id="L126"><a href="#L126"> 126</a>         if pad != 0:</span>
+<span class="source-line" id="L127"><a href="#L127"> 127</a>             loss_masks = F.pad(loss_masks, (0, pad), value=0)</span>
+<span class="source-line" id="L128"><a href="#L128"> 128</a>         loss_masks = loss_masks.chunk(cp_size, dim=0)[cp_rank].unsqueeze(0)</span>
+<span class="source-line" id="L129"><a href="#L129"> 129</a>     else:</span>
+<span class="source-line" id="L130"><a href="#L130"> 130</a>         loss_masks = torch.cat(loss_masks)</span>
+<span class="source-line" id="L131"><a href="#L131"> 131</a>         loss_masks = F.pad(loss_masks, (0, pad), value=0).unsqueeze(0)</span>
+<span class="source-line" id="L132"><a href="#L132"> 132</a> </span>
+<span class="source-line" id="L133"><a href="#L133"> 133</a>     assert loss_masks.shape == tokens.shape, f&quot;loss_masks.shape: {loss_masks.shape}, tokens.shape: {tokens.shape}&quot;</span>
+<span class="source-line" id="L134"><a href="#L134"> 134</a>     batch[&quot;full_loss_masks&quot;] = loss_masks</span>
+<span class="source-line" id="L135"><a href="#L135"> 135</a> </span>
+<span class="source-line" id="L136"><a href="#L136"> 136</a>     # Process multimodal training tensors if present</span>
+<span class="source-line" id="L137"><a href="#L137"> 137</a>     multimodal_train_inputs = batch.get(&quot;multimodal_train_inputs&quot;, None)</span>
+<span class="source-line" id="L138"><a href="#L138"> 138</a>     if multimodal_train_inputs is not None:</span>
+<span class="source-line" id="L139"><a href="#L139"> 139</a>         multimodal_data = {}  # key -&gt; concatenated tensor</span>
+<span class="source-line" id="L140"><a href="#L140"> 140</a>         for mm_input_dict in multimodal_train_inputs:</span>
+<span class="source-line" id="L141"><a href="#L141"> 141</a>             if mm_input_dict is not None:</span>
+<span class="source-line" id="L142"><a href="#L142"> 142</a>                 for key, mm_tensor in mm_input_dict.items():</span>
+<span class="source-line" id="L143"><a href="#L143"> 143</a>                     if key not in multimodal_data:</span>
+<span class="source-line" id="L144"><a href="#L144"> 144</a>                         multimodal_data[key] = mm_tensor</span>
+<span class="source-line" id="L145"><a href="#L145"> 145</a>                     else:</span>
+<span class="source-line" id="L146"><a href="#L146"> 146</a>                         multimodal_data[key] = torch.cat([multimodal_data[key], mm_tensor], dim=0)</span>
+<span class="source-line" id="L147"><a href="#L147"> 147</a>         batch[&quot;multimodal_train_inputs&quot;] = multimodal_data</span>
+<span class="source-line" id="L148"><a href="#L148"> 148</a> </span>
+<span class="source-line" id="L149"><a href="#L149"> 149</a>     return batch</span>
+<span class="source-line" id="L150"><a href="#L150"> 150</a> </span>
+<span class="source-line" id="L151"><a href="#L151"> 151</a> </span>
+<span class="source-line" id="L152"><a href="#L152"> 152</a> class DataIterator:</span>
+<span class="source-line" id="L153"><a href="#L153"> 153</a>     &quot;&quot;&quot;Iterator over a rollout dict following an explicit micro-batch index schedule.&quot;&quot;&quot;</span>
+<span class="source-line" id="L154"><a href="#L154"> 154</a> </span>
+<span class="source-line" id="L155"><a href="#L155"> 155</a>     def __init__(</span>
+<span class="source-line" id="L156"><a href="#L156"> 156</a>         self,</span>
+<span class="source-line" id="L157"><a href="#L157"> 157</a>         rollout_data: RolloutBatch,</span>
+<span class="source-line" id="L158"><a href="#L158"> 158</a>         micro_batch_indices: list[list[int]],</span>
+<span class="source-line" id="L159"><a href="#L159"> 159</a>     ) -&gt; None:</span>
+<span class="source-line" id="L160"><a href="#L160"> 160</a>         &quot;&quot;&quot;Initialize an iterator over ``rollout_data``.</span>
+<span class="source-line" id="L161"><a href="#L161"> 161</a> </span>
+<span class="source-line" id="L162"><a href="#L162"> 162</a>         Args:</span>
+<span class="source-line" id="L163"><a href="#L163"> 163</a>             rollout_data: Dict of per-sample fields for this DP rank.</span>
+<span class="source-line" id="L164"><a href="#L164"> 164</a>             micro_batch_indices: List of mbs, each mbs being the local sample indices to select.</span>
+<span class="source-line" id="L165"><a href="#L165"> 165</a>         &quot;&quot;&quot;</span>
+<span class="source-line" id="L166"><a href="#L166"> 166</a>         self.rollout_data = rollout_data</span>
+<span class="source-line" id="L167"><a href="#L167"> 167</a>         self.micro_batch_indices = micro_batch_indices</span>
+<span class="source-line" id="L168"><a href="#L168"> 168</a>         self.offset = 0</span>
+<span class="source-line" id="L169"><a href="#L169"> 169</a> </span>
+<span class="source-line" id="L170"><a href="#L170"> 170</a>     def get_next(self, keys: Sequence[str]) -&gt; dict[str, list[object] | None]:</span>
+<span class="source-line" id="L171"><a href="#L171"> 171</a>         &quot;&quot;&quot;Return the next micro-batch for the requested keys.</span>
+<span class="source-line" id="L172"><a href="#L172"> 172</a> </span>
+<span class="source-line" id="L173"><a href="#L173"> 173</a>         Returns a dict mapping each key to a list subset (or None if absent).</span>
+<span class="source-line" id="L174"><a href="#L174"> 174</a>         &quot;&quot;&quot;</span>
+<span class="source-line" id="L175"><a href="#L175"> 175</a>         batch = {}</span>
+<span class="source-line" id="L176"><a href="#L176"> 176</a>         indices = self.micro_batch_indices[self.offset]</span>
+<span class="source-line" id="L177"><a href="#L177"> 177</a>         for key in keys:</span>
+<span class="source-line" id="L178"><a href="#L178"> 178</a>             vals = self.rollout_data.get(key, None)</span>
+<span class="source-line" id="L179"><a href="#L179"> 179</a>             if vals is None:</span>
+<span class="source-line" id="L180"><a href="#L180"> 180</a>                 batch[key] = None</span>
+<span class="source-line" id="L181"><a href="#L181"> 181</a>             else:</span>
+<span class="source-line" id="L182"><a href="#L182"> 182</a>                 batch[key] = [vals[i] for i in indices]</span>
+<span class="source-line" id="L183"><a href="#L183"> 183</a>         self.offset += 1</span>
+<span class="source-line" id="L184"><a href="#L184"> 184</a>         return batch</span>
+<span class="source-line" id="L185"><a href="#L185"> 185</a> </span>
+<span class="source-line" id="L186"><a href="#L186"> 186</a>     def reset(self) -&gt; &quot;DataIterator&quot;:</span>
+<span class="source-line" id="L187"><a href="#L187"> 187</a>         &quot;&quot;&quot;Reset internal offset to the start and return self.&quot;&quot;&quot;</span>
+<span class="source-line" id="L188"><a href="#L188"> 188</a>         self.offset = 0</span>
+<span class="source-line" id="L189"><a href="#L189"> 189</a>         return self</span>
+<span class="source-line" id="L190"><a href="#L190"> 190</a> </span>
+<span class="source-line" id="L191"><a href="#L191"> 191</a> </span>
+<span class="source-line" id="L192"><a href="#L192"> 192</a> def get_data_iterator(rollout_data: RolloutBatch) -&gt; list[DataIterator]:</span>
+<span class="source-line" id="L193"><a href="#L193"> 193</a>     &quot;&quot;&quot;Build one ``DataIterator`` per VPP stage from the pre-computed schedule in ``rollout_data``.&quot;&quot;&quot;</span>
+<span class="source-line" id="L194"><a href="#L194"> 194</a>     vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size() or 1</span>
+<span class="source-line" id="L195"><a href="#L195"> 195</a>     micro_batch_indices = rollout_data[&quot;micro_batch_indices&quot;]</span>
+<span class="source-line" id="L196"><a href="#L196"> 196</a>     return [DataIterator(rollout_data, micro_batch_indices) for _ in range(vpp_size)]</span>
+<span class="source-line" id="L197"><a href="#L197"> 197</a> </span>
+<span class="source-line" id="L198"><a href="#L198"> 198</a> </span>
+<span class="source-line" id="L199"><a href="#L199"> 199</a> def tensors_to_cpu(tensor_list):</span>
+<span class="source-line" id="L200"><a href="#L200"> 200</a>     &quot;&quot;&quot;Move a list of GPU tensors to CPU for Ray object store transfer.</span>
+<span class="source-line" id="L201"><a href="#L201"> 201</a> </span>
+<span class="source-line" id="L202"><a href="#L202"> 202</a>     Args:</span>
+<span class="source-line" id="L203"><a href="#L203"> 203</a>         tensor_list: List of GPU tensors, or None.</span>
+<span class="source-line" id="L204"><a href="#L204"> 204</a> </span>
+<span class="source-line" id="L205"><a href="#L205"> 205</a>     Returns:</span>
+<span class="source-line" id="L206"><a href="#L206"> 206</a>         List of CPU tensors (detached), or None if input is None.</span>
+<span class="source-line" id="L207"><a href="#L207"> 207</a>     &quot;&quot;&quot;</span>
+<span class="source-line" id="L208"><a href="#L208"> 208</a>     if tensor_list is None:</span>
+<span class="source-line" id="L209"><a href="#L209"> 209</a>         return None</span>
+<span class="source-line" id="L210"><a href="#L210"> 210</a>     return [t.detach().cpu() for t in tensor_list]</span>
+<span class="source-line" id="L211"><a href="#L211"> 211</a> </span>
+<span class="source-line" id="L212"><a href="#L212"> 212</a> </span>
+<span class="source-line" id="L213"><a href="#L213"> 213</a> def tensors_to_gpu(tensor_list, device=None):</span>
+<span class="source-line" id="L214"><a href="#L214"> 214</a>     &quot;&quot;&quot;Move a list of CPU tensors back to GPU.</span>
+<span class="source-line" id="L215"><a href="#L215"> 215</a> </span>
+<span class="source-line" id="L216"><a href="#L216"> 216</a>     Args:</span>
+<span class="source-line" id="L217"><a href="#L217"> 217</a>         tensor_list: List of CPU tensors, or None.</span>
+<span class="source-line" id="L218"><a href="#L218"> 218</a>         device: Target CUDA device. If None, uses current device.</span>
+<span class="source-line" id="L219"><a href="#L219"> 219</a> </span>
+<span class="source-line" id="L220"><a href="#L220"> 220</a>     Returns:</span>
+<span class="source-line" id="L221"><a href="#L221"> 221</a>         List of GPU tensors, or None if input is None.</span>
+<span class="source-line" id="L222"><a href="#L222"> 222</a>     &quot;&quot;&quot;</span>
+<span class="source-line" id="L223"><a href="#L223"> 223</a>     if tensor_list is None:</span>
+<span class="source-line" id="L224"><a href="#L224"> 224</a>         return None</span>
+<span class="source-line" id="L225"><a href="#L225"> 225</a>     if device is None:</span>
+<span class="source-line" id="L226"><a href="#L226"> 226</a>         device = accelerator.current_device()</span>
+<span class="source-line" id="L227"><a href="#L227"> 227</a>     return [t.to(device=device, dtype=torch.float32) for t in tensor_list]</span></code></pre></main></body></html>

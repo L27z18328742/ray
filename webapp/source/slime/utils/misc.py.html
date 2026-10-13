@@ -1,0 +1,167 @@
+<!doctype html><html lang="zh-Hans"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="description" content="从 Ray 入门到读懂 slime/ray：基于固定源码的中文交互教程。">
+<title>slime/utils/misc.py · Ray 与 slime 源码导读</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="../../../assets/style.css">
+<link rel="stylesheet" href="../../../assets/tutorial.css"></head><body class="source-page"><header class="topbar">
+<a class="brand" href="../../../index.html">Ray 与 slime</a><a href="https://github.com/THUDM/slime/blob/5bae5bb7928d65906e24e99f5b5d3f99a4daaf93/slime/utils/misc.py">GitHub 固定版本 ↗</a></header>
+<main class="source-wrap"><p><a href="../../../chapters/sources.html">← 源码索引</a> · 5bae5bb7928d · 只读快照</p>
+<h1>slime/utils/misc.py</h1><pre class="source-code"><code><span class="source-line" id="L1"><a href="#L1">   1</a> import importlib</span>
+<span class="source-line" id="L2"><a href="#L2">   2</a> import subprocess</span>
+<span class="source-line" id="L3"><a href="#L3">   3</a> import warnings</span>
+<span class="source-line" id="L4"><a href="#L4">   4</a> from collections import defaultdict</span>
+<span class="source-line" id="L5"><a href="#L5">   5</a> from collections.abc import Iterable</span>
+<span class="source-line" id="L6"><a href="#L6">   6</a> from functools import cache</span>
+<span class="source-line" id="L7"><a href="#L7">   7</a> from typing import Any</span>
+<span class="source-line" id="L8"><a href="#L8">   8</a> </span>
+<span class="source-line" id="L9"><a href="#L9">   9</a> import torch</span>
+<span class="source-line" id="L10"><a href="#L10">  10</a> </span>
+<span class="source-line" id="L11"><a href="#L11">  11</a> from slime.utils.http_utils import is_port_available</span>
+<span class="source-line" id="L12"><a href="#L12">  12</a> </span>
+<span class="source-line" id="L13"><a href="#L13">  13</a> </span>
+<span class="source-line" id="L14"><a href="#L14">  14</a> def decode_meta_array(</span>
+<span class="source-line" id="L15"><a href="#L15">  15</a>     meta_info: dict[str, Any],</span>
+<span class="source-line" id="L16"><a href="#L16">  16</a>     keys: str | Iterable[str],</span>
+<span class="source-line" id="L17"><a href="#L17">  17</a>     *,</span>
+<span class="source-line" id="L18"><a href="#L18">  18</a>     dtype: torch.dtype,</span>
+<span class="source-line" id="L19"><a href="#L19">  19</a> ) -&gt; torch.Tensor | None:</span>
+<span class="source-line" id="L20"><a href="#L20">  20</a>     if isinstance(keys, str):</span>
+<span class="source-line" id="L21"><a href="#L21">  21</a>         keys = (keys,)</span>
+<span class="source-line" id="L22"><a href="#L22">  22</a>     for key in keys:</span>
+<span class="source-line" id="L23"><a href="#L23">  23</a>         if key in meta_info:</span>
+<span class="source-line" id="L24"><a href="#L24">  24</a>             value = meta_info[key]</span>
+<span class="source-line" id="L25"><a href="#L25">  25</a>             break</span>
+<span class="source-line" id="L26"><a href="#L26">  26</a>     else:</span>
+<span class="source-line" id="L27"><a href="#L27">  27</a>         return None</span>
+<span class="source-line" id="L28"><a href="#L28">  28</a> </span>
+<span class="source-line" id="L29"><a href="#L29">  29</a>     if value is None:</span>
+<span class="source-line" id="L30"><a href="#L30">  30</a>         return None</span>
+<span class="source-line" id="L31"><a href="#L31">  31</a>     if isinstance(value, str):</span>
+<span class="source-line" id="L32"><a href="#L32">  32</a>         import pybase64</span>
+<span class="source-line" id="L33"><a href="#L33">  33</a> </span>
+<span class="source-line" id="L34"><a href="#L34">  34</a>         value = pybase64.b64decode(value.encode(&quot;ascii&quot;))</span>
+<span class="source-line" id="L35"><a href="#L35">  35</a>     if isinstance(value, bytes | bytearray | memoryview):</span>
+<span class="source-line" id="L36"><a href="#L36">  36</a>         with warnings.catch_warnings():</span>
+<span class="source-line" id="L37"><a href="#L37">  37</a>             warnings.filterwarnings(&quot;ignore&quot;, message=&quot;The given buffer is not writable&quot;, category=UserWarning)</span>
+<span class="source-line" id="L38"><a href="#L38">  38</a>             return torch.frombuffer(value, dtype=dtype)</span>
+<span class="source-line" id="L39"><a href="#L39">  39</a>     if torch.is_tensor(value):</span>
+<span class="source-line" id="L40"><a href="#L40">  40</a>         return value.detach().to(device=&quot;cpu&quot;, dtype=dtype).reshape(-1)</span>
+<span class="source-line" id="L41"><a href="#L41">  41</a>     if hasattr(value, &quot;flags&quot;) and not value.flags.writeable:</span>
+<span class="source-line" id="L42"><a href="#L42">  42</a>         value = value.copy()</span>
+<span class="source-line" id="L43"><a href="#L43">  43</a>     return torch.as_tensor(value, dtype=dtype).reshape(-1)</span>
+<span class="source-line" id="L44"><a href="#L44">  44</a> </span>
+<span class="source-line" id="L45"><a href="#L45">  45</a> </span>
+<span class="source-line" id="L46"><a href="#L46">  46</a> def decode_int32_meta_array(meta_info: dict[str, Any], keys: str | Iterable[str]) -&gt; torch.Tensor | None:</span>
+<span class="source-line" id="L47"><a href="#L47">  47</a>     return decode_meta_array(meta_info, keys, dtype=torch.int32)</span>
+<span class="source-line" id="L48"><a href="#L48">  48</a> </span>
+<span class="source-line" id="L49"><a href="#L49">  49</a> </span>
+<span class="source-line" id="L50"><a href="#L50">  50</a> @cache</span>
+<span class="source-line" id="L51"><a href="#L51">  51</a> def load_function(path):</span>
+<span class="source-line" id="L52"><a href="#L52">  52</a>     &quot;&quot;&quot;</span>
+<span class="source-line" id="L53"><a href="#L53">  53</a>     Load a function from a module.</span>
+<span class="source-line" id="L54"><a href="#L54">  54</a>     :param path: The path to the function, e.g. &quot;module.submodule.function&quot;.</span>
+<span class="source-line" id="L55"><a href="#L55">  55</a>     :return: The function object.</span>
+<span class="source-line" id="L56"><a href="#L56">  56</a>     &quot;&quot;&quot;</span>
+<span class="source-line" id="L57"><a href="#L57">  57</a>     module_path, _, attr = path.rpartition(&quot;.&quot;)</span>
+<span class="source-line" id="L58"><a href="#L58">  58</a>     module = importlib.import_module(module_path)</span>
+<span class="source-line" id="L59"><a href="#L59">  59</a>     return getattr(module, attr)</span>
+<span class="source-line" id="L60"><a href="#L60">  60</a> </span>
+<span class="source-line" id="L61"><a href="#L61">  61</a> </span>
+<span class="source-line" id="L62"><a href="#L62">  62</a> class SingletonMeta(type):</span>
+<span class="source-line" id="L63"><a href="#L63">  63</a>     &quot;&quot;&quot;</span>
+<span class="source-line" id="L64"><a href="#L64">  64</a>     A metaclass for creating singleton classes.</span>
+<span class="source-line" id="L65"><a href="#L65">  65</a>     &quot;&quot;&quot;</span>
+<span class="source-line" id="L66"><a href="#L66">  66</a> </span>
+<span class="source-line" id="L67"><a href="#L67">  67</a>     _instances = {}</span>
+<span class="source-line" id="L68"><a href="#L68">  68</a> </span>
+<span class="source-line" id="L69"><a href="#L69">  69</a>     def __call__(cls, *args, **kwargs):</span>
+<span class="source-line" id="L70"><a href="#L70">  70</a>         if cls not in cls._instances:</span>
+<span class="source-line" id="L71"><a href="#L71">  71</a>             instance = super().__call__(*args, **kwargs)</span>
+<span class="source-line" id="L72"><a href="#L72">  72</a>             cls._instances[cls] = instance</span>
+<span class="source-line" id="L73"><a href="#L73">  73</a>         return cls._instances[cls]</span>
+<span class="source-line" id="L74"><a href="#L74">  74</a> </span>
+<span class="source-line" id="L75"><a href="#L75">  75</a>     def clear_instances(cls):</span>
+<span class="source-line" id="L76"><a href="#L76">  76</a>         cls._instances = {}</span>
+<span class="source-line" id="L77"><a href="#L77">  77</a> </span>
+<span class="source-line" id="L78"><a href="#L78">  78</a> </span>
+<span class="source-line" id="L79"><a href="#L79">  79</a> def exec_command(cmd: str, capture_output: bool = False) -&gt; str | None:</span>
+<span class="source-line" id="L80"><a href="#L80">  80</a>     print(f&quot;EXEC: {cmd}&quot;, flush=True)</span>
+<span class="source-line" id="L81"><a href="#L81">  81</a> </span>
+<span class="source-line" id="L82"><a href="#L82">  82</a>     try:</span>
+<span class="source-line" id="L83"><a href="#L83">  83</a>         result = subprocess.run(</span>
+<span class="source-line" id="L84"><a href="#L84">  84</a>             [&quot;bash&quot;, &quot;-c&quot;, cmd],</span>
+<span class="source-line" id="L85"><a href="#L85">  85</a>             shell=False,</span>
+<span class="source-line" id="L86"><a href="#L86">  86</a>             check=True,</span>
+<span class="source-line" id="L87"><a href="#L87">  87</a>             capture_output=capture_output,</span>
+<span class="source-line" id="L88"><a href="#L88">  88</a>             **(dict(text=True) if capture_output else {}),</span>
+<span class="source-line" id="L89"><a href="#L89">  89</a>         )</span>
+<span class="source-line" id="L90"><a href="#L90">  90</a>     except subprocess.CalledProcessError as e:</span>
+<span class="source-line" id="L91"><a href="#L91">  91</a>         if capture_output:</span>
+<span class="source-line" id="L92"><a href="#L92">  92</a>             print(f&quot;{e.stdout=} {e.stderr=}&quot;)</span>
+<span class="source-line" id="L93"><a href="#L93">  93</a>         raise</span>
+<span class="source-line" id="L94"><a href="#L94">  94</a> </span>
+<span class="source-line" id="L95"><a href="#L95">  95</a>     if capture_output:</span>
+<span class="source-line" id="L96"><a href="#L96">  96</a>         print(f&quot;Captured stdout={result.stdout} stderr={result.stderr}&quot;)</span>
+<span class="source-line" id="L97"><a href="#L97">  97</a>         return result.stdout</span>
+<span class="source-line" id="L98"><a href="#L98">  98</a> </span>
+<span class="source-line" id="L99"><a href="#L99">  99</a> </span>
+<span class="source-line" id="L100"><a href="#L100"> 100</a> def get_current_node_ip():</span>
+<span class="source-line" id="L101"><a href="#L101"> 101</a>     # Lazy import so CPU-only code paths (rm_hub scoring, plugin contracts,</span>
+<span class="source-line" id="L102"><a href="#L102"> 102</a>     # etc.) can use other helpers in this module without requiring ray.</span>
+<span class="source-line" id="L103"><a href="#L103"> 103</a>     import ray</span>
+<span class="source-line" id="L104"><a href="#L104"> 104</a> </span>
+<span class="source-line" id="L105"><a href="#L105"> 105</a>     address = ray._private.services.get_node_ip_address()</span>
+<span class="source-line" id="L106"><a href="#L106"> 106</a>     # strip ipv6 address</span>
+<span class="source-line" id="L107"><a href="#L107"> 107</a>     address = address.strip(&quot;[]&quot;)</span>
+<span class="source-line" id="L108"><a href="#L108"> 108</a>     return address</span>
+<span class="source-line" id="L109"><a href="#L109"> 109</a> </span>
+<span class="source-line" id="L110"><a href="#L110"> 110</a> </span>
+<span class="source-line" id="L111"><a href="#L111"> 111</a> def get_free_port(start_port=10000, consecutive=1):</span>
+<span class="source-line" id="L112"><a href="#L112"> 112</a>     # find the port where port, port + 1, port + 2, ... port + consecutive - 1 are all available</span>
+<span class="source-line" id="L113"><a href="#L113"> 113</a>     port = start_port</span>
+<span class="source-line" id="L114"><a href="#L114"> 114</a>     while not all(is_port_available(port + i) for i in range(consecutive)):</span>
+<span class="source-line" id="L115"><a href="#L115"> 115</a>         port += 1</span>
+<span class="source-line" id="L116"><a href="#L116"> 116</a>     return port</span>
+<span class="source-line" id="L117"><a href="#L117"> 117</a> </span>
+<span class="source-line" id="L118"><a href="#L118"> 118</a> </span>
+<span class="source-line" id="L119"><a href="#L119"> 119</a> def should_run_periodic_action(</span>
+<span class="source-line" id="L120"><a href="#L120"> 120</a>     rollout_id: int,</span>
+<span class="source-line" id="L121"><a href="#L121"> 121</a>     interval: int | None,</span>
+<span class="source-line" id="L122"><a href="#L122"> 122</a>     num_rollout_per_epoch: int | None = None,</span>
+<span class="source-line" id="L123"><a href="#L123"> 123</a>     num_rollout: int | None = None,</span>
+<span class="source-line" id="L124"><a href="#L124"> 124</a> ) -&gt; bool:</span>
+<span class="source-line" id="L125"><a href="#L125"> 125</a>     &quot;&quot;&quot;</span>
+<span class="source-line" id="L126"><a href="#L126"> 126</a>     Return True when a periodic action (eval/save/checkpoint) should run.</span>
+<span class="source-line" id="L127"><a href="#L127"> 127</a> </span>
+<span class="source-line" id="L128"><a href="#L128"> 128</a>     Args:</span>
+<span class="source-line" id="L129"><a href="#L129"> 129</a>         rollout_id: The current rollout index (0-based).</span>
+<span class="source-line" id="L130"><a href="#L130"> 130</a>         interval: Desired cadence; disables checks when None.</span>
+<span class="source-line" id="L131"><a href="#L131"> 131</a>         num_rollout_per_epoch: Optional epoch boundary to treat as a trigger.</span>
+<span class="source-line" id="L132"><a href="#L132"> 132</a>     &quot;&quot;&quot;</span>
+<span class="source-line" id="L133"><a href="#L133"> 133</a>     if interval is None:</span>
+<span class="source-line" id="L134"><a href="#L134"> 134</a>         return False</span>
+<span class="source-line" id="L135"><a href="#L135"> 135</a> </span>
+<span class="source-line" id="L136"><a href="#L136"> 136</a>     if num_rollout is not None and rollout_id == num_rollout - 1:</span>
+<span class="source-line" id="L137"><a href="#L137"> 137</a>         return True</span>
+<span class="source-line" id="L138"><a href="#L138"> 138</a> </span>
+<span class="source-line" id="L139"><a href="#L139"> 139</a>     step = rollout_id + 1</span>
+<span class="source-line" id="L140"><a href="#L140"> 140</a>     return (step % interval == 0) or (num_rollout_per_epoch is not None and step % num_rollout_per_epoch == 0)</span>
+<span class="source-line" id="L141"><a href="#L141"> 141</a> </span>
+<span class="source-line" id="L142"><a href="#L142"> 142</a> </span>
+<span class="source-line" id="L143"><a href="#L143"> 143</a> class Box:</span>
+<span class="source-line" id="L144"><a href="#L144"> 144</a>     def __init__(self, inner):</span>
+<span class="source-line" id="L145"><a href="#L145"> 145</a>         self._inner = inner</span>
+<span class="source-line" id="L146"><a href="#L146"> 146</a> </span>
+<span class="source-line" id="L147"><a href="#L147"> 147</a>     @property</span>
+<span class="source-line" id="L148"><a href="#L148"> 148</a>     def inner(self):</span>
+<span class="source-line" id="L149"><a href="#L149"> 149</a>         return self._inner</span>
+<span class="source-line" id="L150"><a href="#L150"> 150</a> </span>
+<span class="source-line" id="L151"><a href="#L151"> 151</a> </span>
+<span class="source-line" id="L152"><a href="#L152"> 152</a> # details: https://stackoverflow.com/questions/773/how-do-i-use-itertools-groupby</span>
+<span class="source-line" id="L153"><a href="#L153"> 153</a> def group_by(iterable, key=None):</span>
+<span class="source-line" id="L154"><a href="#L154"> 154</a>     &quot;&quot;&quot;Similar to itertools.groupby, but do not require iterable to be sorted&quot;&quot;&quot;</span>
+<span class="source-line" id="L155"><a href="#L155"> 155</a>     ret = defaultdict(list)</span>
+<span class="source-line" id="L156"><a href="#L156"> 156</a>     for item in iterable:</span>
+<span class="source-line" id="L157"><a href="#L157"> 157</a>         ret[key(item) if key is not None else item].append(item)</span>
+<span class="source-line" id="L158"><a href="#L158"> 158</a>     return dict(ret)</span></code></pre></main></body></html>

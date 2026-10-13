@@ -1,0 +1,5 @@
+2026-09-20 17:28:47,677	INFO worker.py:1951 -- Started a local Ray instance.
+round 0: serving=0 -> trained=[1, 1] -> synced=1
+round 1: serving=1 -> trained=[2, 2] -> synced=2
+round 2: serving=2 -> trained=[3, 3] -> synced=3
+PASS mini slime: 3 rounds, distinct DP shards, consistent versions

@@ -1,0 +1,2 @@
+2026-09-20 17:28:38,303	INFO worker.py:1951 -- Started a local Ray instance.
+PASS actors: [{'value': 2, 'pid': 2145}, {'value': 5, 'pid': 2145}, {'value': 1, 'pid': 2144}]

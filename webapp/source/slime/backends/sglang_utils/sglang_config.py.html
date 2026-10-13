@@ -1,0 +1,241 @@
+<!doctype html><html lang="zh-Hans"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="description" content="从 Ray 入门到读懂 slime/ray：基于固定源码的中文交互教程。">
+<title>slime/backends/sglang_utils/sglang_config.py · Ray 与 slime 源码导读</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="../../../../assets/style.css">
+<link rel="stylesheet" href="../../../../assets/tutorial.css"></head><body class="source-page"><header class="topbar">
+<a class="brand" href="../../../../index.html">Ray 与 slime</a><a href="https://github.com/THUDM/slime/blob/5bae5bb7928d65906e24e99f5b5d3f99a4daaf93/slime/backends/sglang_utils/sglang_config.py">GitHub 固定版本 ↗</a></header>
+<main class="source-wrap"><p><a href="../../../../chapters/sources.html">← 源码索引</a> · 5bae5bb7928d · 只读快照</p>
+<h1>slime/backends/sglang_utils/sglang_config.py</h1><pre class="source-code"><code><span class="source-line" id="L1"><a href="#L1">   1</a> &quot;&quot;&quot;Configuration dataclasses for SGLang engine deployment.&quot;&quot;&quot;</span>
+<span class="source-line" id="L2"><a href="#L2">   2</a> </span>
+<span class="source-line" id="L3"><a href="#L3">   3</a> import dataclasses</span>
+<span class="source-line" id="L4"><a href="#L4">   4</a> import logging</span>
+<span class="source-line" id="L5"><a href="#L5">   5</a> </span>
+<span class="source-line" id="L6"><a href="#L6">   6</a> import yaml</span>
+<span class="source-line" id="L7"><a href="#L7">   7</a> </span>
+<span class="source-line" id="L8"><a href="#L8">   8</a> logger = logging.getLogger(__name__)</span>
+<span class="source-line" id="L9"><a href="#L9">   9</a> </span>
+<span class="source-line" id="L10"><a href="#L10">  10</a> </span>
+<span class="source-line" id="L11"><a href="#L11">  11</a> @dataclasses.dataclass</span>
+<span class="source-line" id="L12"><a href="#L12">  12</a> class ServerGroupConfig:</span>
+<span class="source-line" id="L13"><a href="#L13">  13</a>     &quot;&quot;&quot;Configuration for a single server group.</span>
+<span class="source-line" id="L14"><a href="#L14">  14</a> </span>
+<span class="source-line" id="L15"><a href="#L15">  15</a>     Attributes:</span>
+<span class="source-line" id="L16"><a href="#L16">  16</a>         worker_type: One of &quot;regular&quot;, &quot;prefill&quot;, &quot;decode&quot;, &quot;placeholder&quot;,</span>
+<span class="source-line" id="L17"><a href="#L17">  17</a>                      or &quot;encoder&quot;.</span>
+<span class="source-line" id="L18"><a href="#L18">  18</a>                      &quot;placeholder&quot; reserves GPU slots without creating engines.</span>
+<span class="source-line" id="L19"><a href="#L19">  19</a>                      &quot;encoder&quot; creates encoder-only engines for EPD</span>
+<span class="source-line" id="L20"><a href="#L20">  20</a>                      (Encoder-Prefill-Decode) disaggregation; encoder engines</span>
+<span class="source-line" id="L21"><a href="#L21">  21</a>                      are started first and their URLs are automatically</span>
+<span class="source-line" id="L22"><a href="#L22">  22</a>                      injected into prefill groups as ``encoder_urls``.</span>
+<span class="source-line" id="L23"><a href="#L23">  23</a>         num_gpus: Total number of GPUs for this group.</span>
+<span class="source-line" id="L24"><a href="#L24">  24</a>         num_gpus_per_engine: GPUs per engine for this group.  Overrides the</span>
+<span class="source-line" id="L25"><a href="#L25">  25</a>                              model-level or global ``--rollout-num-gpus-per-engine``.</span>
+<span class="source-line" id="L26"><a href="#L26">  26</a>         overrides: Optional dict of SGLang ``ServerArgs`` field overrides.</span>
+<span class="source-line" id="L27"><a href="#L27">  27</a>                    These are applied on top of the base CLI ``--sglang-*``</span>
+<span class="source-line" id="L28"><a href="#L28">  28</a>                    arguments in ``_compute_server_args``.</span>
+<span class="source-line" id="L29"><a href="#L29">  29</a>     &quot;&quot;&quot;</span>
+<span class="source-line" id="L30"><a href="#L30">  30</a> </span>
+<span class="source-line" id="L31"><a href="#L31">  31</a>     worker_type: str</span>
+<span class="source-line" id="L32"><a href="#L32">  32</a>     num_gpus: int</span>
+<span class="source-line" id="L33"><a href="#L33">  33</a>     num_gpus_per_engine: int | None = None</span>
+<span class="source-line" id="L34"><a href="#L34">  34</a>     overrides: dict = dataclasses.field(default_factory=dict)</span>
+<span class="source-line" id="L35"><a href="#L35">  35</a> </span>
+<span class="source-line" id="L36"><a href="#L36">  36</a>     def __post_init__(self):</span>
+<span class="source-line" id="L37"><a href="#L37">  37</a>         valid_types = {&quot;regular&quot;, &quot;prefill&quot;, &quot;decode&quot;, &quot;placeholder&quot;, &quot;encoder&quot;}</span>
+<span class="source-line" id="L38"><a href="#L38">  38</a>         assert (</span>
+<span class="source-line" id="L39"><a href="#L39">  39</a>             self.worker_type in valid_types</span>
+<span class="source-line" id="L40"><a href="#L40">  40</a>         ), f&quot;Invalid worker_type &#x27;{self.worker_type}&#x27;, must be one of {valid_types}&quot;</span>
+<span class="source-line" id="L41"><a href="#L41">  41</a>         assert self.num_gpus &gt; 0, f&quot;num_gpus must be &gt; 0, got {self.num_gpus}&quot;</span>
+<span class="source-line" id="L42"><a href="#L42">  42</a> </span>
+<span class="source-line" id="L43"><a href="#L43">  43</a> </span>
+<span class="source-line" id="L44"><a href="#L44">  44</a> @dataclasses.dataclass</span>
+<span class="source-line" id="L45"><a href="#L45">  45</a> class ModelConfig:</span>
+<span class="source-line" id="L46"><a href="#L46">  46</a>     &quot;&quot;&quot;Configuration for a single model deployment.</span>
+<span class="source-line" id="L47"><a href="#L47">  47</a> </span>
+<span class="source-line" id="L48"><a href="#L48">  48</a>     Attributes:</span>
+<span class="source-line" id="L49"><a href="#L49">  49</a>         name: Unique name for this model (e.g. &quot;actor&quot;, &quot;reward&quot;).</span>
+<span class="source-line" id="L50"><a href="#L50">  50</a>         model_path: HF checkpoint path.  Falls back to ``args.hf_checkpoint``.</span>
+<span class="source-line" id="L51"><a href="#L51">  51</a>         num_gpus_per_engine: Default GPUs per engine for all groups in this</span>
+<span class="source-line" id="L52"><a href="#L52">  52</a>                              model.  Individual groups can override.</span>
+<span class="source-line" id="L53"><a href="#L53">  53</a>         server_groups: Server group configurations for this model.</span>
+<span class="source-line" id="L54"><a href="#L54">  54</a>         update_weights: Whether this model receives weight updates from</span>
+<span class="source-line" id="L55"><a href="#L55">  55</a>                         training.  Set to ``False`` for frozen models</span>
+<span class="source-line" id="L56"><a href="#L56">  56</a>                         (reference, reward, etc.).  When ``None`` (default),</span>
+<span class="source-line" id="L57"><a href="#L57">  57</a>                         automatically inferred in ``resolve()``: ``True`` if</span>
+<span class="source-line" id="L58"><a href="#L58">  58</a>                         model_path matches ``args.hf_checkpoint``, ``False``</span>
+<span class="source-line" id="L59"><a href="#L59">  59</a>                         otherwise.</span>
+<span class="source-line" id="L60"><a href="#L60">  60</a>     &quot;&quot;&quot;</span>
+<span class="source-line" id="L61"><a href="#L61">  61</a> </span>
+<span class="source-line" id="L62"><a href="#L62">  62</a>     name: str</span>
+<span class="source-line" id="L63"><a href="#L63">  63</a>     model_path: str | None = None</span>
+<span class="source-line" id="L64"><a href="#L64">  64</a>     num_gpus_per_engine: int | None = None</span>
+<span class="source-line" id="L65"><a href="#L65">  65</a>     server_groups: list[ServerGroupConfig] = dataclasses.field(default_factory=list)</span>
+<span class="source-line" id="L66"><a href="#L66">  66</a>     update_weights: bool | None = None</span>
+<span class="source-line" id="L67"><a href="#L67">  67</a> </span>
+<span class="source-line" id="L68"><a href="#L68">  68</a>     def resolve(self, args) -&gt; None:</span>
+<span class="source-line" id="L69"><a href="#L69">  69</a>         &quot;&quot;&quot;Resolve per-group defaults from model-level then args-level values.&quot;&quot;&quot;</span>
+<span class="source-line" id="L70"><a href="#L70">  70</a>         default_gpus_per_engine = self.num_gpus_per_engine or args.rollout_num_gpus_per_engine</span>
+<span class="source-line" id="L71"><a href="#L71">  71</a>         default_model_path = self.model_path or args.hf_checkpoint</span>
+<span class="source-line" id="L72"><a href="#L72">  72</a>         for g in self.server_groups:</span>
+<span class="source-line" id="L73"><a href="#L73">  73</a>             if g.num_gpus_per_engine is None:</span>
+<span class="source-line" id="L74"><a href="#L74">  74</a>                 g.num_gpus_per_engine = default_gpus_per_engine</span>
+<span class="source-line" id="L75"><a href="#L75">  75</a>             # Inject model_path into overrides so _compute_server_args picks it up.</span>
+<span class="source-line" id="L76"><a href="#L76">  76</a>             if &quot;model_path&quot; not in g.overrides:</span>
+<span class="source-line" id="L77"><a href="#L77">  77</a>                 g.overrides[&quot;model_path&quot;] = default_model_path</span>
+<span class="source-line" id="L78"><a href="#L78">  78</a> </span>
+<span class="source-line" id="L79"><a href="#L79">  79</a>         # Validate: all server groups within a model must share the same model_path.</span>
+<span class="source-line" id="L80"><a href="#L80">  80</a>         if self.server_groups:</span>
+<span class="source-line" id="L81"><a href="#L81">  81</a>             model_paths = {g.overrides[&quot;model_path&quot;] for g in self.server_groups}</span>
+<span class="source-line" id="L82"><a href="#L82">  82</a>             assert len(model_paths) == 1, (</span>
+<span class="source-line" id="L83"><a href="#L83">  83</a>                 f&quot;Model &#x27;{self.name}&#x27; has server groups with different model_path values: &quot;</span>
+<span class="source-line" id="L84"><a href="#L84">  84</a>                 f&quot;{model_paths}. All server groups within a model must use the same model_path.&quot;</span>
+<span class="source-line" id="L85"><a href="#L85">  85</a>             )</span>
+<span class="source-line" id="L86"><a href="#L86">  86</a>             effective_model_path = model_paths.pop()</span>
+<span class="source-line" id="L87"><a href="#L87">  87</a>         else:</span>
+<span class="source-line" id="L88"><a href="#L88">  88</a>             effective_model_path = default_model_path</span>
+<span class="source-line" id="L89"><a href="#L89">  89</a> </span>
+<span class="source-line" id="L90"><a href="#L90">  90</a>         # Auto-infer update_weights when not explicitly set.</span>
+<span class="source-line" id="L91"><a href="#L91">  91</a>         if self.update_weights is None:</span>
+<span class="source-line" id="L92"><a href="#L92">  92</a>             if effective_model_path != args.hf_checkpoint:</span>
+<span class="source-line" id="L93"><a href="#L93">  93</a>                 logger.warning(</span>
+<span class="source-line" id="L94"><a href="#L94">  94</a>                     f&quot;Model &#x27;{self.name}&#x27; uses model_path=&#x27;{effective_model_path}&#x27; which differs &quot;</span>
+<span class="source-line" id="L95"><a href="#L95">  95</a>                     f&quot;from hf_checkpoint=&#x27;{args.hf_checkpoint}&#x27;. Defaulting update_weights to False. &quot;</span>
+<span class="source-line" id="L96"><a href="#L96">  96</a>                     f&quot;Set update_weights explicitly in the config to suppress this warning.&quot;</span>
+<span class="source-line" id="L97"><a href="#L97">  97</a>                 )</span>
+<span class="source-line" id="L98"><a href="#L98">  98</a>                 self.update_weights = False</span>
+<span class="source-line" id="L99"><a href="#L99">  99</a>             else:</span>
+<span class="source-line" id="L100"><a href="#L100"> 100</a>                 self.update_weights = True</span>
+<span class="source-line" id="L101"><a href="#L101"> 101</a> </span>
+<span class="source-line" id="L102"><a href="#L102"> 102</a>     @property</span>
+<span class="source-line" id="L103"><a href="#L103"> 103</a>     def has_pd_disaggregation(self) -&gt; bool:</span>
+<span class="source-line" id="L104"><a href="#L104"> 104</a>         return any(g.worker_type in (&quot;prefill&quot;, &quot;decode&quot;) for g in self.server_groups)</span>
+<span class="source-line" id="L105"><a href="#L105"> 105</a> </span>
+<span class="source-line" id="L106"><a href="#L106"> 106</a>     @property</span>
+<span class="source-line" id="L107"><a href="#L107"> 107</a>     def has_encoder_disaggregation(self) -&gt; bool:</span>
+<span class="source-line" id="L108"><a href="#L108"> 108</a>         return any(g.worker_type == &quot;encoder&quot; for g in self.server_groups)</span>
+<span class="source-line" id="L109"><a href="#L109"> 109</a> </span>
+<span class="source-line" id="L110"><a href="#L110"> 110</a>     @property</span>
+<span class="source-line" id="L111"><a href="#L111"> 111</a>     def total_num_gpus(self) -&gt; int:</span>
+<span class="source-line" id="L112"><a href="#L112"> 112</a>         return sum(g.num_gpus for g in self.server_groups)</span>
+<span class="source-line" id="L113"><a href="#L113"> 113</a> </span>
+<span class="source-line" id="L114"><a href="#L114"> 114</a> </span>
+<span class="source-line" id="L115"><a href="#L115"> 115</a> @dataclasses.dataclass</span>
+<span class="source-line" id="L116"><a href="#L116"> 116</a> class SglangConfig:</span>
+<span class="source-line" id="L117"><a href="#L117"> 117</a>     &quot;&quot;&quot;Configuration for SGLang engine deployment.</span>
+<span class="source-line" id="L118"><a href="#L118"> 118</a> </span>
+<span class="source-line" id="L119"><a href="#L119"> 119</a>     Loaded from ``--sglang-config`` YAML file.</span>
+<span class="source-line" id="L120"><a href="#L120"> 120</a> </span>
+<span class="source-line" id="L121"><a href="#L121"> 121</a>     **Config format**::</span>
+<span class="source-line" id="L122"><a href="#L122"> 122</a> </span>
+<span class="source-line" id="L123"><a href="#L123"> 123</a>         sglang:</span>
+<span class="source-line" id="L124"><a href="#L124"> 124</a>           - name: actor</span>
+<span class="source-line" id="L125"><a href="#L125"> 125</a>             model_path: /path/to/actor</span>
+<span class="source-line" id="L126"><a href="#L126"> 126</a>             update_weights: true          # receives training weight updates (default)</span>
+<span class="source-line" id="L127"><a href="#L127"> 127</a>             num_gpus_per_engine: 2</span>
+<span class="source-line" id="L128"><a href="#L128"> 128</a>             server_groups:</span>
+<span class="source-line" id="L129"><a href="#L129"> 129</a>               - worker_type: prefill</span>
+<span class="source-line" id="L130"><a href="#L130"> 130</a>                 num_gpus: 4</span>
+<span class="source-line" id="L131"><a href="#L131"> 131</a>                 num_gpus_per_engine: 2</span>
+<span class="source-line" id="L132"><a href="#L132"> 132</a>               - worker_type: decode</span>
+<span class="source-line" id="L133"><a href="#L133"> 133</a>                 num_gpus: 8</span>
+<span class="source-line" id="L134"><a href="#L134"> 134</a>                 num_gpus_per_engine: 4</span>
+<span class="source-line" id="L135"><a href="#L135"> 135</a>           - name: ref</span>
+<span class="source-line" id="L136"><a href="#L136"> 136</a>             model_path: /path/to/ref</span>
+<span class="source-line" id="L137"><a href="#L137"> 137</a>             update_weights: false          # frozen, no weight updates</span>
+<span class="source-line" id="L138"><a href="#L138"> 138</a>             server_groups:</span>
+<span class="source-line" id="L139"><a href="#L139"> 139</a>               - worker_type: regular</span>
+<span class="source-line" id="L140"><a href="#L140"> 140</a>                 num_gpus: 4</span>
+<span class="source-line" id="L141"><a href="#L141"> 141</a> </span>
+<span class="source-line" id="L142"><a href="#L142"> 142</a>     Each model gets its own router.  ``placeholder`` groups reserve GPU</span>
+<span class="source-line" id="L143"><a href="#L143"> 143</a>     slots without creating engines.  ``overrides`` are ``ServerArgs``</span>
+<span class="source-line" id="L144"><a href="#L144"> 144</a>     field names applied on top of the base ``--sglang-*`` CLI args.</span>
+<span class="source-line" id="L145"><a href="#L145"> 145</a> </span>
+<span class="source-line" id="L146"><a href="#L146"> 146</a>     Set ``update_weights: false`` for frozen models (reference, reward,</span>
+<span class="source-line" id="L147"><a href="#L147"> 147</a>     etc.) that should not receive weight updates from training.</span>
+<span class="source-line" id="L148"><a href="#L148"> 148</a> </span>
+<span class="source-line" id="L149"><a href="#L149"> 149</a>     .. note::</span>
+<span class="source-line" id="L150"><a href="#L150"> 150</a> </span>
+<span class="source-line" id="L151"><a href="#L151"> 151</a>        ``engine_groups`` is accepted as a backward-compatible alias for</span>
+<span class="source-line" id="L152"><a href="#L152"> 152</a>        ``server_groups`` in the YAML config.</span>
+<span class="source-line" id="L153"><a href="#L153"> 153</a>     &quot;&quot;&quot;</span>
+<span class="source-line" id="L154"><a href="#L154"> 154</a> </span>
+<span class="source-line" id="L155"><a href="#L155"> 155</a>     models: list[ModelConfig]</span>
+<span class="source-line" id="L156"><a href="#L156"> 156</a> </span>
+<span class="source-line" id="L157"><a href="#L157"> 157</a>     @staticmethod</span>
+<span class="source-line" id="L158"><a href="#L158"> 158</a>     def from_yaml(path: str) -&gt; &quot;SglangConfig&quot;:</span>
+<span class="source-line" id="L159"><a href="#L159"> 159</a>         with open(path) as f:</span>
+<span class="source-line" id="L160"><a href="#L160"> 160</a>             data = yaml.safe_load(f)</span>
+<span class="source-line" id="L161"><a href="#L161"> 161</a> </span>
+<span class="source-line" id="L162"><a href="#L162"> 162</a>         assert &quot;sglang&quot; in data, (</span>
+<span class="source-line" id="L163"><a href="#L163"> 163</a>             f&quot;sglang config must have a &#x27;sglang&#x27; key, got {list(data.keys())}. &quot;</span>
+<span class="source-line" id="L164"><a href="#L164"> 164</a>             f&quot;Wrap your server_groups inside a model entry under &#x27;sglang&#x27;.&quot;</span>
+<span class="source-line" id="L165"><a href="#L165"> 165</a>         )</span>
+<span class="source-line" id="L166"><a href="#L166"> 166</a>         models = []</span>
+<span class="source-line" id="L167"><a href="#L167"> 167</a>         for m in data[&quot;sglang&quot;]:</span>
+<span class="source-line" id="L168"><a href="#L168"> 168</a>             # Accept both &quot;server_groups&quot; and legacy &quot;engine_groups&quot;.</span>
+<span class="source-line" id="L169"><a href="#L169"> 169</a>             raw_groups = m.get(&quot;server_groups&quot;) or m.get(&quot;engine_groups&quot;) or []</span>
+<span class="source-line" id="L170"><a href="#L170"> 170</a>             groups = [ServerGroupConfig(**g) for g in raw_groups]</span>
+<span class="source-line" id="L171"><a href="#L171"> 171</a>             models.append(</span>
+<span class="source-line" id="L172"><a href="#L172"> 172</a>                 ModelConfig(</span>
+<span class="source-line" id="L173"><a href="#L173"> 173</a>                     name=m[&quot;name&quot;],</span>
+<span class="source-line" id="L174"><a href="#L174"> 174</a>                     model_path=m.get(&quot;model_path&quot;),</span>
+<span class="source-line" id="L175"><a href="#L175"> 175</a>                     num_gpus_per_engine=m.get(&quot;num_gpus_per_engine&quot;),</span>
+<span class="source-line" id="L176"><a href="#L176"> 176</a>                     server_groups=groups,</span>
+<span class="source-line" id="L177"><a href="#L177"> 177</a>                     update_weights=m.get(&quot;update_weights&quot;),</span>
+<span class="source-line" id="L178"><a href="#L178"> 178</a>                 )</span>
+<span class="source-line" id="L179"><a href="#L179"> 179</a>             )</span>
+<span class="source-line" id="L180"><a href="#L180"> 180</a>         return SglangConfig(models=models)</span>
+<span class="source-line" id="L181"><a href="#L181"> 181</a> </span>
+<span class="source-line" id="L182"><a href="#L182"> 182</a>     @staticmethod</span>
+<span class="source-line" id="L183"><a href="#L183"> 183</a>     def from_prefill_num_servers(args) -&gt; &quot;SglangConfig&quot;:</span>
+<span class="source-line" id="L184"><a href="#L184"> 184</a>         &quot;&quot;&quot;Build a config equivalent to the legacy --prefill-num-servers flag.&quot;&quot;&quot;</span>
+<span class="source-line" id="L185"><a href="#L185"> 185</a>         total_gpus = args.rollout_num_gpus</span>
+<span class="source-line" id="L186"><a href="#L186"> 186</a>         prefill_gpus = args.prefill_num_servers * args.rollout_num_gpus_per_engine</span>
+<span class="source-line" id="L187"><a href="#L187"> 187</a>         decode_gpus = total_gpus - prefill_gpus</span>
+<span class="source-line" id="L188"><a href="#L188"> 188</a>         assert decode_gpus &gt; 0, f&quot;No decode GPUs: total {total_gpus}, prefill {prefill_gpus}&quot;</span>
+<span class="source-line" id="L189"><a href="#L189"> 189</a>         return SglangConfig(</span>
+<span class="source-line" id="L190"><a href="#L190"> 190</a>             models=[</span>
+<span class="source-line" id="L191"><a href="#L191"> 191</a>                 ModelConfig(</span>
+<span class="source-line" id="L192"><a href="#L192"> 192</a>                     name=&quot;default&quot;,</span>
+<span class="source-line" id="L193"><a href="#L193"> 193</a>                     server_groups=[</span>
+<span class="source-line" id="L194"><a href="#L194"> 194</a>                         ServerGroupConfig(worker_type=&quot;prefill&quot;, num_gpus=prefill_gpus),</span>
+<span class="source-line" id="L195"><a href="#L195"> 195</a>                         ServerGroupConfig(worker_type=&quot;decode&quot;, num_gpus=decode_gpus),</span>
+<span class="source-line" id="L196"><a href="#L196"> 196</a>                     ],</span>
+<span class="source-line" id="L197"><a href="#L197"> 197</a>                 )</span>
+<span class="source-line" id="L198"><a href="#L198"> 198</a>             ]</span>
+<span class="source-line" id="L199"><a href="#L199"> 199</a>         )</span>
+<span class="source-line" id="L200"><a href="#L200"> 200</a> </span>
+<span class="source-line" id="L201"><a href="#L201"> 201</a>     @property</span>
+<span class="source-line" id="L202"><a href="#L202"> 202</a>     def has_pd_disaggregation(self) -&gt; bool:</span>
+<span class="source-line" id="L203"><a href="#L203"> 203</a>         return any(m.has_pd_disaggregation for m in self.models)</span>
+<span class="source-line" id="L204"><a href="#L204"> 204</a> </span>
+<span class="source-line" id="L205"><a href="#L205"> 205</a>     @property</span>
+<span class="source-line" id="L206"><a href="#L206"> 206</a>     def total_num_gpus(self) -&gt; int:</span>
+<span class="source-line" id="L207"><a href="#L207"> 207</a>         return sum(m.total_num_gpus for m in self.models)</span>
+<span class="source-line" id="L208"><a href="#L208"> 208</a> </span>
+<span class="source-line" id="L209"><a href="#L209"> 209</a> </span>
+<span class="source-line" id="L210"><a href="#L210"> 210</a> def resolve_sglang_config(args) -&gt; SglangConfig:</span>
+<span class="source-line" id="L211"><a href="#L211"> 211</a>     &quot;&quot;&quot;Resolve the configured, legacy PD, or default SGLang deployment.&quot;&quot;&quot;</span>
+<span class="source-line" id="L212"><a href="#L212"> 212</a>     if getattr(args, &quot;sglang_config&quot;, None) is not None:</span>
+<span class="source-line" id="L213"><a href="#L213"> 213</a>         config = SglangConfig.from_yaml(args.sglang_config)</span>
+<span class="source-line" id="L214"><a href="#L214"> 214</a>         expected = args.rollout_num_gpus</span>
+<span class="source-line" id="L215"><a href="#L215"> 215</a>         actual = config.total_num_gpus</span>
+<span class="source-line" id="L216"><a href="#L216"> 216</a>         assert actual == expected, f&quot;sglang_config total GPUs ({actual}) != rollout_num_gpus ({expected})&quot;</span>
+<span class="source-line" id="L217"><a href="#L217"> 217</a>         return config</span>
+<span class="source-line" id="L218"><a href="#L218"> 218</a> </span>
+<span class="source-line" id="L219"><a href="#L219"> 219</a>     if args.rollout_num_gpus == 0:</span>
+<span class="source-line" id="L220"><a href="#L220"> 220</a>         return SglangConfig(models=[ModelConfig(name=&quot;default&quot;, server_groups=[])])</span>
+<span class="source-line" id="L221"><a href="#L221"> 221</a> </span>
+<span class="source-line" id="L222"><a href="#L222"> 222</a>     if args.prefill_num_servers is not None:</span>
+<span class="source-line" id="L223"><a href="#L223"> 223</a>         return SglangConfig.from_prefill_num_servers(args)</span>
+<span class="source-line" id="L224"><a href="#L224"> 224</a> </span>
+<span class="source-line" id="L225"><a href="#L225"> 225</a>     return SglangConfig(</span>
+<span class="source-line" id="L226"><a href="#L226"> 226</a>         models=[</span>
+<span class="source-line" id="L227"><a href="#L227"> 227</a>             ModelConfig(</span>
+<span class="source-line" id="L228"><a href="#L228"> 228</a>                 name=&quot;default&quot;,</span>
+<span class="source-line" id="L229"><a href="#L229"> 229</a>                 server_groups=[ServerGroupConfig(worker_type=&quot;regular&quot;, num_gpus=args.rollout_num_gpus)],</span>
+<span class="source-line" id="L230"><a href="#L230"> 230</a>             )</span>
+<span class="source-line" id="L231"><a href="#L231"> 231</a>         ]</span>
+<span class="source-line" id="L232"><a href="#L232"> 232</a>     )</span></code></pre></main></body></html>

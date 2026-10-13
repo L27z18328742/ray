@@ -1,0 +1,88 @@
+<!doctype html><html lang="zh-Hans"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="description" content="从 Ray 入门到读懂 slime/ray：基于固定源码的中文交互教程。">
+<title>把训练 worker 一个个启动起来 · Ray 与 slime 源码导读</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="stylesheet" href="../assets/tutorial.css"></head><body data-chapter="ch05" data-lab="">
+<a class="skip" href="#content">跳到正文</a>
+<header class="topbar"><a class="brand" href="../index.html">Ray 与 slime<span>源码导读</span></a>
+<nav class="chapnav"><a href="../index.html">全部章节</a><a href="sources.html">版本与证据</a></nav></header>
+<div class="layout"><aside class="sidebar"><nav class="toc" id="toc"><h2>本章目录</h2><details class="book-nav"><summary>全书章节</summary><a href="ch00.html">先看一轮训练怎样发生</a><a href="ch01.html">第一次 remote：任务与结果引用</a><a href="ch02.html">Actor：让模型留在一个进程里</a><a href="ch03.html">等待、依赖与背压</a><a href="ch04.html">先安排座位：Placement Group</a><a href="ch05.html" aria-current="page">把训练 worker 一个个启动起来</a><a href="ch06.html">RolloutManager 如何组织生成</a><a href="ch07.html">一批数据如何到达训练 GPU</a><a href="ch08.html">读通 train.py 的一整个循环</a><a href="ch09.html">训练完，推理模型怎么拿到新权重</a><a href="ch10.html">同卡部署、卸载与进程释放</a><a href="ch11.html">真正的异步发生在哪里</a><a href="ch12.html">卡住与失败时，沿边界排查</a><a href="ch13.html">亲手做一个 CPU 版迷你 slime</a><a href="glossary.html">术语与对象速查</a><a href="practice.html">理解题与源码寻路任务</a><a href="sources.html">版本、证据与源码索引</a></details></nav></aside>
+<main class="main"><p class="chapter-meta">源码主线 / 第 5 章 · 约 25 分钟 · 已展开</p>
+<details class="mobile-nav"><summary>选择章节</summary><a href="ch00.html">先看一轮训练怎样发生</a><a href="ch01.html">第一次 remote：任务与结果引用</a><a href="ch02.html">Actor：让模型留在一个进程里</a><a href="ch03.html">等待、依赖与背压</a><a href="ch04.html">先安排座位：Placement Group</a><a href="ch05.html" aria-current="page">把训练 worker 一个个启动起来</a><a href="ch06.html">RolloutManager 如何组织生成</a><a href="ch07.html">一批数据如何到达训练 GPU</a><a href="ch08.html">读通 train.py 的一整个循环</a><a href="ch09.html">训练完，推理模型怎么拿到新权重</a><a href="ch10.html">同卡部署、卸载与进程释放</a><a href="ch11.html">真正的异步发生在哪里</a><a href="ch12.html">卡住与失败时，沿边界排查</a><a href="ch13.html">亲手做一个 CPU 版迷你 slime</a><a href="glossary.html">术语与对象速查</a><a href="practice.html">理解题与源码寻路任务</a><a href="sources.html">版本、证据与源码索引</a></details><div id="lab-banner"></div>
+<article id="content" class="prose"></article><noscript>请启用 JavaScript 阅读网页，或直接查看 content 中的 Markdown。</noscript>
+<section id="lab" class="lab" hidden><h2 class="lab-title"></h2><p class="lab-intro"></p><div id="lab-root"></div></section>
+<div class="study-actions"><button id="mark-read" type="button">标记为已读</button><span id="read-status" role="status"></span></div>
+<nav class="pager"><a class="prev" href="ch04.html"><span class="dir">← 上一章</span><div class="ttl">先安排座位：Placement Group</div></a><a class="next" href="ch06.html"><span class="dir">下一章 →</span><div class="ttl">RolloutManager 如何组织生成</div></a></nav><footer class="pagefoot">独立中文源码教程 · slime 5bae5bb7928d · 源码事实、教学简化与实验结果分别标注。<br>视觉样式参考 Ultra-Scale Playbook 中文版；署名见 <a href="sources.html">来源与许可</a>。</footer>
+</main></div><script type="text/markdown" id="chapter-md"># 把训练 worker 一个个启动起来
+
+> 阅读目标：追踪 rank 0 的地址如何到达其他 worker，并分清 Ray PG 与 PyTorch process group。状态：已展开。
+
+## 已经有资源，下一步才是创建进程
+
+继续两张训练卡的例子。`world_size = num_nodes × num_gpus_per_node = 2`，所以要启动两个训练 Ray Actor。每个 Actor 长期持有自己的模型分片或副本、optimizer 状态和分布式通信状态。
+
+本章主链：**create_training_models → create_actor_model → RayTrainGroup.create → _allocate_gpus_for_actor → 构造所有 Actor → init 所有 Actor → 连接 manager**。
+
+## 先看四个初始化参数
+
+| 参数 | 两 worker 示例 | 作用 |
+|---|---|---|
+| `world_size` | 都是 2 | 训练进程组总进程数 |
+| `rank` | 0、1 | 当前进程在训练组中的全局编号 |
+| `master_addr` | rank 0 所在节点地址 | 进程组初始化的会合地址 |
+| `master_port` | rank 0 查找的空闲端口 | 配合地址完成会合 |
+
+这里的 master 与 Ray head 不是同一个概念。Ray 集群的控制节点负责 Ray 服务；训练的 `MASTER_ADDR` 是此组训练 worker 建立 PyTorch 通信时使用的地址。
+
+## rank 0 为什么先被询问
+
+阅读 [RayTrainGroup._allocate_gpus_for_actor](../source/slime/ray/actor_group.py.html#L57)。先选择默认 `MegatronTrainRayActor` 实现，再包装成远程类。创建循环的核心可以简化为：
+
+```python
+master_addr, master_port = None, None
+for rank in range(world_size):
+    actor = TrainRayActor.options(...).remote(
+        world_size, rank, master_addr, master_port
+    )
+    if rank == 0:
+        master_addr, master_port = ray.get(
+            actor.get_master_addr_and_port.remote()
+        )
+    self._actor_handlers.append(actor)
+```
+
+rank 0 的构造函数发现没有 master 地址，就选择自己节点的 IP 与空闲端口。driver 等待拿到它，再把同样的地址端口传给 rank 1。**此时还没有让 rank 0 单独完成全部分布式初始化。**否则它可能一直等尚未创建的同伴。
+
+随后 `create()` 才对所有 worker 提交 `init.remote()`，一次性 `ray.get` 这组引用。这种“先创建所有成员，再同时初始化”对需要互相等待的分布式系统很重要。
+
+## 从 Ray 的 GPU ID 到训练设备
+
+[TrainRayActor.__init__](../source/slime/ray/train_actor.py.html#L26)设置 `MASTER_ADDR / MASTER_PORT / WORLD_SIZE / RANK / LOCAL_RANK`。本版本通过 `get_local_gpu_id()` 调用 accelerator 的可见设备映射，不应简单把 `rank` 当本机 GPU ID。
+
+训练 Actor 的 runtime env 设置了一组 `RAY_EXPERIMENTAL_NOSET_*_VISIBLE_DEVICES` 开关。读这个项目时，要同时查看 Ray 分配的 GPU ID、进程可见设备和显式设备选择，不能直接套“每个 Actor 都只能看到一个 cuda:0”的直觉。
+
+资源也有两层：PG bundle 预留的是 1 GPU；[allocate_train_group](../source/slime/ray/placement_group.py.html#L140)实际传入 `num_gpus_per_actor=0.4`，worker 的 `.options()` 覆盖了远程类上初始的 1 GPU 声明。这是逻辑资源记账，不是显存的 40% 硬上限。第 10 章专门解释。
+
+## 进入真正的分布式训练初始化
+
+1. [RayTrainGroup.create](../source/slime/ray/actor_group.py.html#L188)：输入 manager handle，创建 worker 并等待 `init`，返回起始轮次列表。
+2. [MegatronTrainRayActor.init](../source/slime/backends/megatron_utils/actor.py.html#L64)：调用父类，再初始化 Megatron 和模型 / optimizer，得到 checkpoint 对应的起始轮次。
+3. [TrainRayActor.init](../source/slime/ray/train_actor.py.html#L47)：设置实际设备，调用 `dist.init_process_group`，并初始化 Gloo 辅助组。
+4. [TrainRayActor.set_rollout_manager](../source/slime/ray/train_actor.py.html#L123)：保存 manager handle；训练 rank 0 把 `train_parallel_config` 发给 manager，告诉它后续按多少个 DP 分片准备数据。
+5. [create_training_models](../source/slime/ray/placement_group.py.html#L186)：要求返回的起始轮次一致，必要时恢复数据源进度，最终交还模型组给 driver。
+
+## 两种 group 不是同一个东西
+
+| 名称 | 管理什么 | 代表操作 |
+|---|---|---|
+| Ray Placement Group | 一组资源的放置与预留 | `placement_group(...)` |
+| PyTorch Process Group | 一组训练进程之间的通信 | `dist.init_process_group(...)` |
+| slime RayTrainGroup | driver 里的 worker handle 集合 | `async_train / update_weights` |
+
+选读 [RayActor](../source/slime/ray/ray_actor.py.html#L4)，它只提供地址、端口等小工具，本身没有 `@ray.remote`。暂缓 Megatron 并行组内部算法；这里以“初始化完成后可以一起训练”为接口边界。
+
+**理解题：为什么源码先逐个创建 Actor，再对所有 Actor 提交 `init.remote()`？如果每创建一个就立刻等待它的 `dist.init_process_group()` 完成，会有什么风险？**
+</script>
+<script src="../assets/marked.min.js"></script><script src="../assets/app.js"></script><script src="../assets/labs.js"></script></body></html>

@@ -1,0 +1,65 @@
+<!doctype html><html lang="zh-Hans"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="description" content="从 Ray 入门到读懂 slime/ray：基于固定源码的中文交互教程。">
+<title>slime/backends/megatron_utils/update_weight/__init__.py · Ray 与 slime 源码导读</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="../../../../../assets/style.css">
+<link rel="stylesheet" href="../../../../../assets/tutorial.css"></head><body class="source-page"><header class="topbar">
+<a class="brand" href="../../../../../index.html">Ray 与 slime</a><a href="https://github.com/THUDM/slime/blob/5bae5bb7928d65906e24e99f5b5d3f99a4daaf93/slime/backends/megatron_utils/update_weight/__init__.py">GitHub 固定版本 ↗</a></header>
+<main class="source-wrap"><p><a href="../../../../../chapters/sources.html">← 源码索引</a> · 5bae5bb7928d · 只读快照</p>
+<h1>slime/backends/megatron_utils/update_weight/__init__.py</h1><pre class="source-code"><code><span class="source-line" id="L1"><a href="#L1">   1</a> from __future__ import annotations</span>
+<span class="source-line" id="L2"><a href="#L2">   2</a> </span>
+<span class="source-line" id="L3"><a href="#L3">   3</a> from argparse import Namespace</span>
+<span class="source-line" id="L4"><a href="#L4">   4</a> from collections.abc import Callable, Mapping, Sequence</span>
+<span class="source-line" id="L5"><a href="#L5">   5</a> from typing import Any</span>
+<span class="source-line" id="L6"><a href="#L6">   6</a> </span>
+<span class="source-line" id="L7"><a href="#L7">   7</a> import torch</span>
+<span class="source-line" id="L8"><a href="#L8">   8</a> </span>
+<span class="source-line" id="L9"><a href="#L9">   9</a> </span>
+<span class="source-line" id="L10"><a href="#L10">  10</a> def create_weight_updater(</span>
+<span class="source-line" id="L11"><a href="#L11">  11</a>     args: Namespace,</span>
+<span class="source-line" id="L12"><a href="#L12">  12</a>     model: Sequence[torch.nn.Module],</span>
+<span class="source-line" id="L13"><a href="#L13">  13</a>     weights_getter: Callable[[], Mapping[str, torch.Tensor]],</span>
+<span class="source-line" id="L14"><a href="#L14">  14</a>     *,</span>
+<span class="source-line" id="L15"><a href="#L15">  15</a>     model_name: str,</span>
+<span class="source-line" id="L16"><a href="#L16">  16</a>     quantization_config: dict[str, Any] | None,</span>
+<span class="source-line" id="L17"><a href="#L17">  17</a> ):</span>
+<span class="source-line" id="L18"><a href="#L18">  18</a>     &quot;&quot;&quot;Select and construct the weight updater for the configured transport.&quot;&quot;&quot;</span>
+<span class="source-line" id="L19"><a href="#L19">  19</a>     update_weight_mode = args.update_weight_mode</span>
+<span class="source-line" id="L20"><a href="#L20">  20</a>     update_weight_transport = args.update_weight_transport</span>
+<span class="source-line" id="L21"><a href="#L21">  21</a> </span>
+<span class="source-line" id="L22"><a href="#L22">  22</a>     if update_weight_mode == &quot;delta&quot;:</span>
+<span class="source-line" id="L23"><a href="#L23">  23</a>         # Delta sync is disk-transport only: each engine&#x27;s /pull_weights applies the published</span>
+<span class="source-line" id="L24"><a href="#L24">  24</a>         # deltas into a host-local checkpoint on every host it spans, and the engines reload</span>
+<span class="source-line" id="L25"><a href="#L25">  25</a>         # via vanilla update_weights_from_disk.</span>
+<span class="source-line" id="L26"><a href="#L26">  26</a>         assert not args.colocate, &quot;--update-weight-mode=delta is not supported with --colocate&quot;</span>
+<span class="source-line" id="L27"><a href="#L27">  27</a>         assert update_weight_transport == &quot;disk&quot;, &quot;--update-weight-mode=delta requires --update-weight-transport=disk&quot;</span>
+<span class="source-line" id="L28"><a href="#L28">  28</a>         from .update_weight_from_disk_delta import UpdateWeightFromDiskDelta</span>
+<span class="source-line" id="L29"><a href="#L29">  29</a> </span>
+<span class="source-line" id="L30"><a href="#L30">  30</a>         update_weight_cls = UpdateWeightFromDiskDelta</span>
+<span class="source-line" id="L31"><a href="#L31">  31</a>     elif update_weight_transport == &quot;disk&quot;:</span>
+<span class="source-line" id="L32"><a href="#L32">  32</a>         from .update_weight_from_disk import UpdateWeightFromDisk</span>
+<span class="source-line" id="L33"><a href="#L33">  33</a> </span>
+<span class="source-line" id="L34"><a href="#L34">  34</a>         update_weight_cls = UpdateWeightFromDisk</span>
+<span class="source-line" id="L35"><a href="#L35">  35</a>     elif args.colocate:</span>
+<span class="source-line" id="L36"><a href="#L36">  36</a>         from .update_weight_from_tensor import UpdateWeightFromTensor</span>
+<span class="source-line" id="L37"><a href="#L37">  37</a> </span>
+<span class="source-line" id="L38"><a href="#L38">  38</a>         update_weight_cls = UpdateWeightFromTensor</span>
+<span class="source-line" id="L39"><a href="#L39">  39</a>     else:</span>
+<span class="source-line" id="L40"><a href="#L40">  40</a>         assert update_weight_mode == &quot;full&quot;</span>
+<span class="source-line" id="L41"><a href="#L41">  41</a>         assert (</span>
+<span class="source-line" id="L42"><a href="#L42">  42</a>             update_weight_transport == &quot;nccl&quot;</span>
+<span class="source-line" id="L43"><a href="#L43">  43</a>         ), f&quot;unsupported weight sync mode/transport: {update_weight_mode!r}/{update_weight_transport!r}&quot;</span>
+<span class="source-line" id="L44"><a href="#L44">  44</a>         from .update_weight_from_distributed import UpdateWeightFromDistributed</span>
+<span class="source-line" id="L45"><a href="#L45">  45</a> </span>
+<span class="source-line" id="L46"><a href="#L46">  46</a>         update_weight_cls = UpdateWeightFromDistributed</span>
+<span class="source-line" id="L47"><a href="#L47">  47</a> </span>
+<span class="source-line" id="L48"><a href="#L48">  48</a>     updater = update_weight_cls(</span>
+<span class="source-line" id="L49"><a href="#L49">  49</a>         args,</span>
+<span class="source-line" id="L50"><a href="#L50">  50</a>         model,</span>
+<span class="source-line" id="L51"><a href="#L51">  51</a>         weights_getter,</span>
+<span class="source-line" id="L52"><a href="#L52">  52</a>         model_name=model_name,</span>
+<span class="source-line" id="L53"><a href="#L53">  53</a>         quantization_config=quantization_config,</span>
+<span class="source-line" id="L54"><a href="#L54">  54</a>     )</span>
+<span class="source-line" id="L55"><a href="#L55">  55</a>     updater.weight_version = getattr(args, &quot;update_weight_start_version&quot;, 0)</span>
+<span class="source-line" id="L56"><a href="#L56">  56</a>     return updater</span></code></pre></main></body></html>

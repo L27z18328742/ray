@@ -1,0 +1,252 @@
+<!doctype html><html lang="zh-Hans"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="description" content="从 Ray 入门到读懂 slime/ray：基于固定源码的中文交互教程。">
+<title>slime/rollout/data_source.py · Ray 与 slime 源码导读</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="../../../assets/style.css">
+<link rel="stylesheet" href="../../../assets/tutorial.css"></head><body class="source-page"><header class="topbar">
+<a class="brand" href="../../../index.html">Ray 与 slime</a><a href="https://github.com/THUDM/slime/blob/5bae5bb7928d65906e24e99f5b5d3f99a4daaf93/slime/rollout/data_source.py">GitHub 固定版本 ↗</a></header>
+<main class="source-wrap"><p><a href="../../../chapters/sources.html">← 源码索引</a> · 5bae5bb7928d · 只读快照</p>
+<h1>slime/rollout/data_source.py</h1><pre class="source-code"><code><span class="source-line" id="L1"><a href="#L1">   1</a> import abc</span>
+<span class="source-line" id="L2"><a href="#L2">   2</a> import copy</span>
+<span class="source-line" id="L3"><a href="#L3">   3</a> import logging</span>
+<span class="source-line" id="L4"><a href="#L4">   4</a> import os</span>
+<span class="source-line" id="L5"><a href="#L5">   5</a> from pathlib import Path</span>
+<span class="source-line" id="L6"><a href="#L6">   6</a> </span>
+<span class="source-line" id="L7"><a href="#L7">   7</a> import torch</span>
+<span class="source-line" id="L8"><a href="#L8">   8</a> </span>
+<span class="source-line" id="L9"><a href="#L9">   9</a> from slime.utils.data import Dataset</span>
+<span class="source-line" id="L10"><a href="#L10">  10</a> from slime.utils.misc import load_function</span>
+<span class="source-line" id="L11"><a href="#L11">  11</a> from slime.utils.processing_utils import load_processor, load_tokenizer</span>
+<span class="source-line" id="L12"><a href="#L12">  12</a> from slime.utils.types import Sample</span>
+<span class="source-line" id="L13"><a href="#L13">  13</a> </span>
+<span class="source-line" id="L14"><a href="#L14">  14</a> logger = logging.getLogger(__name__)</span>
+<span class="source-line" id="L15"><a href="#L15">  15</a> </span>
+<span class="source-line" id="L16"><a href="#L16">  16</a> </span>
+<span class="source-line" id="L17"><a href="#L17">  17</a> class DataSource(abc.ABC):</span>
+<span class="source-line" id="L18"><a href="#L18">  18</a>     @abc.abstractmethod</span>
+<span class="source-line" id="L19"><a href="#L19">  19</a>     def get_samples(self, num_samples: int) -&gt; list[list[Sample]]:</span>
+<span class="source-line" id="L20"><a href="#L20">  20</a>         &quot;&quot;&quot;</span>
+<span class="source-line" id="L21"><a href="#L21">  21</a>         Return num_samples samples</span>
+<span class="source-line" id="L22"><a href="#L22">  22</a>         &quot;&quot;&quot;</span>
+<span class="source-line" id="L23"><a href="#L23">  23</a> </span>
+<span class="source-line" id="L24"><a href="#L24">  24</a>     @abc.abstractmethod</span>
+<span class="source-line" id="L25"><a href="#L25">  25</a>     def add_samples(self, samples: list[list[Sample]]):</span>
+<span class="source-line" id="L26"><a href="#L26">  26</a>         &quot;&quot;&quot;</span>
+<span class="source-line" id="L27"><a href="#L27">  27</a>         Add samples to the data source</span>
+<span class="source-line" id="L28"><a href="#L28">  28</a>         &quot;&quot;&quot;</span>
+<span class="source-line" id="L29"><a href="#L29">  29</a> </span>
+<span class="source-line" id="L30"><a href="#L30">  30</a>     @abc.abstractmethod</span>
+<span class="source-line" id="L31"><a href="#L31">  31</a>     def save(self, rollout_id):</span>
+<span class="source-line" id="L32"><a href="#L32">  32</a>         &quot;&quot;&quot;</span>
+<span class="source-line" id="L33"><a href="#L33">  33</a>         Save the state of the data source</span>
+<span class="source-line" id="L34"><a href="#L34">  34</a>         &quot;&quot;&quot;</span>
+<span class="source-line" id="L35"><a href="#L35">  35</a> </span>
+<span class="source-line" id="L36"><a href="#L36">  36</a>     @abc.abstractmethod</span>
+<span class="source-line" id="L37"><a href="#L37">  37</a>     def load(self, rollout_id=None):</span>
+<span class="source-line" id="L38"><a href="#L38">  38</a>         &quot;&quot;&quot;</span>
+<span class="source-line" id="L39"><a href="#L39">  39</a>         Load the state of the data source</span>
+<span class="source-line" id="L40"><a href="#L40">  40</a>         &quot;&quot;&quot;</span>
+<span class="source-line" id="L41"><a href="#L41">  41</a> </span>
+<span class="source-line" id="L42"><a href="#L42">  42</a>     @abc.abstractmethod</span>
+<span class="source-line" id="L43"><a href="#L43">  43</a>     def __len__(self) -&gt; int:</span>
+<span class="source-line" id="L44"><a href="#L44">  44</a>         &quot;&quot;&quot;</span>
+<span class="source-line" id="L45"><a href="#L45">  45</a>         Length of the data source. May change when samples are added/fetched.</span>
+<span class="source-line" id="L46"><a href="#L46">  46</a>         &quot;&quot;&quot;</span>
+<span class="source-line" id="L47"><a href="#L47">  47</a> </span>
+<span class="source-line" id="L48"><a href="#L48">  48</a> </span>
+<span class="source-line" id="L49"><a href="#L49">  49</a> # TODO may further refactor data-loading part later</span>
+<span class="source-line" id="L50"><a href="#L50">  50</a> class RolloutDataSource(DataSource):</span>
+<span class="source-line" id="L51"><a href="#L51">  51</a>     def __init__(self, args):</span>
+<span class="source-line" id="L52"><a href="#L52">  52</a>         self.args = args</span>
+<span class="source-line" id="L53"><a href="#L53">  53</a> </span>
+<span class="source-line" id="L54"><a href="#L54">  54</a>         self.epoch_id = 0</span>
+<span class="source-line" id="L55"><a href="#L55">  55</a>         self.sample_group_index = 0</span>
+<span class="source-line" id="L56"><a href="#L56">  56</a>         self.sample_index = 0</span>
+<span class="source-line" id="L57"><a href="#L57">  57</a>         self.sample_offset = 0</span>
+<span class="source-line" id="L58"><a href="#L58">  58</a>         # TODO remove this</span>
+<span class="source-line" id="L59"><a href="#L59">  59</a>         self.metadata = {}</span>
+<span class="source-line" id="L60"><a href="#L60">  60</a> </span>
+<span class="source-line" id="L61"><a href="#L61">  61</a>         if args.rollout_global_dataset and args.prompt_data is not None:</span>
+<span class="source-line" id="L62"><a href="#L62">  62</a>             tokenizer = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)</span>
+<span class="source-line" id="L63"><a href="#L63">  63</a>             processor = load_processor(args.hf_checkpoint, trust_remote_code=True)</span>
+<span class="source-line" id="L64"><a href="#L64">  64</a> </span>
+<span class="source-line" id="L65"><a href="#L65">  65</a>             # TODO move (during the refactor)</span>
+<span class="source-line" id="L66"><a href="#L66">  66</a>             if (d := args.dump_details) is not None:</span>
+<span class="source-line" id="L67"><a href="#L67">  67</a>                 tokenizer.save_pretrained(Path(d) / &quot;tokenizer&quot;)</span>
+<span class="source-line" id="L68"><a href="#L68">  68</a>                 if processor:</span>
+<span class="source-line" id="L69"><a href="#L69">  69</a>                     processor.save_pretrained(Path(d) / &quot;processor&quot;)</span>
+<span class="source-line" id="L70"><a href="#L70">  70</a> </span>
+<span class="source-line" id="L71"><a href="#L71">  71</a>             self.dataset = Dataset(</span>
+<span class="source-line" id="L72"><a href="#L72">  72</a>                 args.prompt_data,</span>
+<span class="source-line" id="L73"><a href="#L73">  73</a>                 tokenizer=tokenizer,</span>
+<span class="source-line" id="L74"><a href="#L74">  74</a>                 processor=processor,</span>
+<span class="source-line" id="L75"><a href="#L75">  75</a>                 max_length=args.rollout_max_prompt_len,</span>
+<span class="source-line" id="L76"><a href="#L76">  76</a>                 prompt_key=args.input_key,</span>
+<span class="source-line" id="L77"><a href="#L77">  77</a>                 multimodal_keys=args.multimodal_keys,</span>
+<span class="source-line" id="L78"><a href="#L78">  78</a>                 label_key=args.label_key,</span>
+<span class="source-line" id="L79"><a href="#L79">  79</a>                 metadata_key=args.metadata_key,</span>
+<span class="source-line" id="L80"><a href="#L80">  80</a>                 tool_key=args.tool_key,</span>
+<span class="source-line" id="L81"><a href="#L81">  81</a>                 apply_chat_template=args.apply_chat_template,</span>
+<span class="source-line" id="L82"><a href="#L82">  82</a>                 apply_chat_template_kwargs=args.apply_chat_template_kwargs,</span>
+<span class="source-line" id="L83"><a href="#L83">  83</a>                 seed=args.rollout_seed,</span>
+<span class="source-line" id="L84"><a href="#L84">  84</a>             )</span>
+<span class="source-line" id="L85"><a href="#L85">  85</a>             if self.args.rollout_shuffle:</span>
+<span class="source-line" id="L86"><a href="#L86">  86</a>                 self.dataset.shuffle(self.epoch_id)</span>
+<span class="source-line" id="L87"><a href="#L87">  87</a>         else:</span>
+<span class="source-line" id="L88"><a href="#L88">  88</a>             self.dataset = None</span>
+<span class="source-line" id="L89"><a href="#L89">  89</a> </span>
+<span class="source-line" id="L90"><a href="#L90">  90</a>     def get_samples(self, num_samples):</span>
+<span class="source-line" id="L91"><a href="#L91">  91</a>         # TODO further improve code</span>
+<span class="source-line" id="L92"><a href="#L92">  92</a>         if self.dataset is not None:</span>
+<span class="source-line" id="L93"><a href="#L93">  93</a>             if self.sample_offset + num_samples &lt;= len(self.dataset):</span>
+<span class="source-line" id="L94"><a href="#L94">  94</a>                 prompt_samples = self.dataset.samples[self.sample_offset : self.sample_offset + num_samples]</span>
+<span class="source-line" id="L95"><a href="#L95">  95</a>                 self.sample_offset += num_samples</span>
+<span class="source-line" id="L96"><a href="#L96">  96</a>             else:</span>
+<span class="source-line" id="L97"><a href="#L97">  97</a>                 prompt_samples = self.dataset.samples[self.sample_offset :]</span>
+<span class="source-line" id="L98"><a href="#L98">  98</a>                 num_samples -= len(prompt_samples)</span>
+<span class="source-line" id="L99"><a href="#L99">  99</a>                 self.epoch_id += 1</span>
+<span class="source-line" id="L100"><a href="#L100"> 100</a>                 if self.args.rollout_shuffle:</span>
+<span class="source-line" id="L101"><a href="#L101"> 101</a>                     self.dataset.shuffle(self.epoch_id)</span>
+<span class="source-line" id="L102"><a href="#L102"> 102</a>                 prompt_samples += self.dataset.samples[:num_samples]</span>
+<span class="source-line" id="L103"><a href="#L103"> 103</a>                 self.sample_offset = num_samples</span>
+<span class="source-line" id="L104"><a href="#L104"> 104</a>         else:</span>
+<span class="source-line" id="L105"><a href="#L105"> 105</a>             prompt_samples = [Sample() for _ in range(num_samples)]</span>
+<span class="source-line" id="L106"><a href="#L106"> 106</a> </span>
+<span class="source-line" id="L107"><a href="#L107"> 107</a>         samples = []</span>
+<span class="source-line" id="L108"><a href="#L108"> 108</a>         for prompt_sample in prompt_samples:</span>
+<span class="source-line" id="L109"><a href="#L109"> 109</a>             group = []</span>
+<span class="source-line" id="L110"><a href="#L110"> 110</a>             for _ in range(self.args.n_samples_per_prompt):</span>
+<span class="source-line" id="L111"><a href="#L111"> 111</a>                 sample = copy.deepcopy(prompt_sample)</span>
+<span class="source-line" id="L112"><a href="#L112"> 112</a>                 sample.group_index = self.sample_group_index</span>
+<span class="source-line" id="L113"><a href="#L113"> 113</a>                 sample.index = self.sample_index</span>
+<span class="source-line" id="L114"><a href="#L114"> 114</a>                 self.sample_index += 1</span>
+<span class="source-line" id="L115"><a href="#L115"> 115</a>                 group.append(sample)</span>
+<span class="source-line" id="L116"><a href="#L116"> 116</a>             self.sample_group_index += 1</span>
+<span class="source-line" id="L117"><a href="#L117"> 117</a>             samples.append(group)</span>
+<span class="source-line" id="L118"><a href="#L118"> 118</a>         return samples</span>
+<span class="source-line" id="L119"><a href="#L119"> 119</a> </span>
+<span class="source-line" id="L120"><a href="#L120"> 120</a>     def add_samples(self, samples: list[list[Sample]]):</span>
+<span class="source-line" id="L121"><a href="#L121"> 121</a>         raise RuntimeError(f&quot;Cannot add samples to {self.__class__.__name__}. This is a read-only data source.&quot;)</span>
+<span class="source-line" id="L122"><a href="#L122"> 122</a> </span>
+<span class="source-line" id="L123"><a href="#L123"> 123</a>     def save(self, rollout_id):</span>
+<span class="source-line" id="L124"><a href="#L124"> 124</a>         if not self.args.rollout_global_dataset:</span>
+<span class="source-line" id="L125"><a href="#L125"> 125</a>             return</span>
+<span class="source-line" id="L126"><a href="#L126"> 126</a> </span>
+<span class="source-line" id="L127"><a href="#L127"> 127</a>         state_dict = {</span>
+<span class="source-line" id="L128"><a href="#L128"> 128</a>             &quot;sample_offset&quot;: self.sample_offset,</span>
+<span class="source-line" id="L129"><a href="#L129"> 129</a>             &quot;epoch_id&quot;: self.epoch_id,</span>
+<span class="source-line" id="L130"><a href="#L130"> 130</a>             &quot;sample_group_index&quot;: self.sample_group_index,</span>
+<span class="source-line" id="L131"><a href="#L131"> 131</a>             &quot;sample_index&quot;: self.sample_index,</span>
+<span class="source-line" id="L132"><a href="#L132"> 132</a>             &quot;metadata&quot;: self.metadata,</span>
+<span class="source-line" id="L133"><a href="#L133"> 133</a>         }</span>
+<span class="source-line" id="L134"><a href="#L134"> 134</a>         path = os.path.join(self.args.save, f&quot;rollout/global_dataset_state_dict_{rollout_id}.pt&quot;)</span>
+<span class="source-line" id="L135"><a href="#L135"> 135</a>         os.makedirs(os.path.dirname(path), exist_ok=True)</span>
+<span class="source-line" id="L136"><a href="#L136"> 136</a>         torch.save(state_dict, path)</span>
+<span class="source-line" id="L137"><a href="#L137"> 137</a> </span>
+<span class="source-line" id="L138"><a href="#L138"> 138</a>     def load(self, rollout_id=None):</span>
+<span class="source-line" id="L139"><a href="#L139"> 139</a>         if not self.args.rollout_global_dataset:</span>
+<span class="source-line" id="L140"><a href="#L140"> 140</a>             return</span>
+<span class="source-line" id="L141"><a href="#L141"> 141</a> </span>
+<span class="source-line" id="L142"><a href="#L142"> 142</a>         if self.args.load is None:</span>
+<span class="source-line" id="L143"><a href="#L143"> 143</a>             return</span>
+<span class="source-line" id="L144"><a href="#L144"> 144</a> </span>
+<span class="source-line" id="L145"><a href="#L145"> 145</a>         path = os.path.join(self.args.load, f&quot;rollout/global_dataset_state_dict_{rollout_id}.pt&quot;)</span>
+<span class="source-line" id="L146"><a href="#L146"> 146</a>         if not os.path.exists(path):</span>
+<span class="source-line" id="L147"><a href="#L147"> 147</a>             logger.info(f&quot;Checkpoint {path} does not exist.&quot;)</span>
+<span class="source-line" id="L148"><a href="#L148"> 148</a>             return</span>
+<span class="source-line" id="L149"><a href="#L149"> 149</a> </span>
+<span class="source-line" id="L150"><a href="#L150"> 150</a>         logger.info(f&quot;load metadata from {path}&quot;)</span>
+<span class="source-line" id="L151"><a href="#L151"> 151</a>         logger.info(f&quot;load metadata: {self.metadata}&quot;)</span>
+<span class="source-line" id="L152"><a href="#L152"> 152</a>         state_dict = torch.load(path)</span>
+<span class="source-line" id="L153"><a href="#L153"> 153</a>         self.sample_offset = state_dict.get(&quot;sample_offset&quot;, 0)</span>
+<span class="source-line" id="L154"><a href="#L154"> 154</a>         self.epoch_id = state_dict.get(&quot;epoch_id&quot;, 0)</span>
+<span class="source-line" id="L155"><a href="#L155"> 155</a>         self.sample_group_index = state_dict.get(&quot;sample_group_index&quot;, 0)</span>
+<span class="source-line" id="L156"><a href="#L156"> 156</a>         self.sample_index = state_dict.get(&quot;sample_index&quot;, 0)</span>
+<span class="source-line" id="L157"><a href="#L157"> 157</a>         self.metadata = state_dict.get(&quot;metadata&quot;, {})</span>
+<span class="source-line" id="L158"><a href="#L158"> 158</a> </span>
+<span class="source-line" id="L159"><a href="#L159"> 159</a>         if self.args.rollout_global_dataset and self.args.rollout_shuffle and self.dataset is not None:</span>
+<span class="source-line" id="L160"><a href="#L160"> 160</a>             self.dataset.shuffle(self.epoch_id)</span>
+<span class="source-line" id="L161"><a href="#L161"> 161</a> </span>
+<span class="source-line" id="L162"><a href="#L162"> 162</a>     def __len__(self) -&gt; int:</span>
+<span class="source-line" id="L163"><a href="#L163"> 163</a>         if self.dataset is None:</span>
+<span class="source-line" id="L164"><a href="#L164"> 164</a>             return 0</span>
+<span class="source-line" id="L165"><a href="#L165"> 165</a>         return len(self.dataset)</span>
+<span class="source-line" id="L166"><a href="#L166"> 166</a> </span>
+<span class="source-line" id="L167"><a href="#L167"> 167</a> </span>
+<span class="source-line" id="L168"><a href="#L168"> 168</a> class RolloutDataSourceWithBuffer(RolloutDataSource):</span>
+<span class="source-line" id="L169"><a href="#L169"> 169</a>     def __init__(self, args):</span>
+<span class="source-line" id="L170"><a href="#L170"> 170</a>         super().__init__(args)</span>
+<span class="source-line" id="L171"><a href="#L171"> 171</a>         self.buffer = []</span>
+<span class="source-line" id="L172"><a href="#L172"> 172</a>         if self.args.buffer_filter_path is None:</span>
+<span class="source-line" id="L173"><a href="#L173"> 173</a>             self.buffer_filter = pop_oldest if getattr(args, &quot;buffer_sort_by_staleness&quot;, False) else pop_first</span>
+<span class="source-line" id="L174"><a href="#L174"> 174</a>         else:</span>
+<span class="source-line" id="L175"><a href="#L175"> 175</a>             self.buffer_filter = load_function(self.args.buffer_filter_path)</span>
+<span class="source-line" id="L176"><a href="#L176"> 176</a> </span>
+<span class="source-line" id="L177"><a href="#L177"> 177</a>     def get_samples(self, num_samples: int) -&gt; list[list[Sample]]:</span>
+<span class="source-line" id="L178"><a href="#L178"> 178</a>         &quot;&quot;&quot;</span>
+<span class="source-line" id="L179"><a href="#L179"> 179</a>         Return num_samples samples</span>
+<span class="source-line" id="L180"><a href="#L180"> 180</a>         &quot;&quot;&quot;</span>
+<span class="source-line" id="L181"><a href="#L181"> 181</a> </span>
+<span class="source-line" id="L182"><a href="#L182"> 182</a>         samples = self._get_samples_from_buffer(num_samples)</span>
+<span class="source-line" id="L183"><a href="#L183"> 183</a>         num_samples -= len(samples)</span>
+<span class="source-line" id="L184"><a href="#L184"> 184</a> </span>
+<span class="source-line" id="L185"><a href="#L185"> 185</a>         if num_samples == 0:</span>
+<span class="source-line" id="L186"><a href="#L186"> 186</a>             return samples</span>
+<span class="source-line" id="L187"><a href="#L187"> 187</a> </span>
+<span class="source-line" id="L188"><a href="#L188"> 188</a>         samples += super().get_samples(num_samples=num_samples)</span>
+<span class="source-line" id="L189"><a href="#L189"> 189</a>         return samples</span>
+<span class="source-line" id="L190"><a href="#L190"> 190</a> </span>
+<span class="source-line" id="L191"><a href="#L191"> 191</a>     def _get_samples_from_buffer(self, num_samples: int) -&gt; list[list[Sample]]:</span>
+<span class="source-line" id="L192"><a href="#L192"> 192</a>         if len(self.buffer) == 0 or num_samples == 0:</span>
+<span class="source-line" id="L193"><a href="#L193"> 193</a>             return []</span>
+<span class="source-line" id="L194"><a href="#L194"> 194</a> </span>
+<span class="source-line" id="L195"><a href="#L195"> 195</a>         samples = self.buffer_filter(self.args, None, self.buffer, num_samples)</span>
+<span class="source-line" id="L196"><a href="#L196"> 196</a>         return samples</span>
+<span class="source-line" id="L197"><a href="#L197"> 197</a> </span>
+<span class="source-line" id="L198"><a href="#L198"> 198</a>     def add_samples(self, samples: list[list[Sample]]):</span>
+<span class="source-line" id="L199"><a href="#L199"> 199</a>         &quot;&quot;&quot;</span>
+<span class="source-line" id="L200"><a href="#L200"> 200</a>         Add a sample group to buffer.</span>
+<span class="source-line" id="L201"><a href="#L201"> 201</a>         &quot;&quot;&quot;</span>
+<span class="source-line" id="L202"><a href="#L202"> 202</a>         if not samples:</span>
+<span class="source-line" id="L203"><a href="#L203"> 203</a>             return</span>
+<span class="source-line" id="L204"><a href="#L204"> 204</a>         assert isinstance(samples, list), f&quot;samples must be a list, got {type(samples)}&quot;</span>
+<span class="source-line" id="L205"><a href="#L205"> 205</a>         assert isinstance(samples[0], list), f&quot;the elements of samples must be list, got {type(samples[0])}&quot;</span>
+<span class="source-line" id="L206"><a href="#L206"> 206</a>         for i in range(0, len(samples)):</span>
+<span class="source-line" id="L207"><a href="#L207"> 207</a>             assert (</span>
+<span class="source-line" id="L208"><a href="#L208"> 208</a>                 len(samples[i]) == self.args.n_samples_per_prompt</span>
+<span class="source-line" id="L209"><a href="#L209"> 209</a>             ), f&quot;the length of the elements of samples must be equal to n_samples_per_prompt, got {len(samples[i])} != {self.args.n_samples_per_prompt}&quot;</span>
+<span class="source-line" id="L210"><a href="#L210"> 210</a>             group = samples[i]  # type: ignore</span>
+<span class="source-line" id="L211"><a href="#L211"> 211</a>             self.buffer.append(group)</span>
+<span class="source-line" id="L212"><a href="#L212"> 212</a> </span>
+<span class="source-line" id="L213"><a href="#L213"> 213</a>     # TODO remove</span>
+<span class="source-line" id="L214"><a href="#L214"> 214</a>     def update_metadata(self, metadata: dict):</span>
+<span class="source-line" id="L215"><a href="#L215"> 215</a>         self.metadata.update(metadata)</span>
+<span class="source-line" id="L216"><a href="#L216"> 216</a> </span>
+<span class="source-line" id="L217"><a href="#L217"> 217</a>     # TODO remove</span>
+<span class="source-line" id="L218"><a href="#L218"> 218</a>     def get_metadata(self):</span>
+<span class="source-line" id="L219"><a href="#L219"> 219</a>         return self.metadata</span>
+<span class="source-line" id="L220"><a href="#L220"> 220</a> </span>
+<span class="source-line" id="L221"><a href="#L221"> 221</a>     def get_buffer_length(self):</span>
+<span class="source-line" id="L222"><a href="#L222"> 222</a>         return len(self.buffer)</span>
+<span class="source-line" id="L223"><a href="#L223"> 223</a> </span>
+<span class="source-line" id="L224"><a href="#L224"> 224</a> </span>
+<span class="source-line" id="L225"><a href="#L225"> 225</a> def pop_oldest(args, rollout_id, buffer: list[list[Sample]], num_samples: int) -&gt; list[list[Sample]]:</span>
+<span class="source-line" id="L226"><a href="#L226"> 226</a>     &quot;&quot;&quot;Resume groups with the oldest generated tokens first; preserve ties.&quot;&quot;&quot;</span>
+<span class="source-line" id="L227"><a href="#L227"> 227</a> </span>
+<span class="source-line" id="L228"><a href="#L228"> 228</a>     def oldest_version(group):</span>
+<span class="source-line" id="L229"><a href="#L229"> 229</a>         versions = (str(v) for sample in group for v in (sample.weight_versions or []))</span>
+<span class="source-line" id="L230"><a href="#L230"> 230</a>         return min(</span>
+<span class="source-line" id="L231"><a href="#L231"> 231</a>             (int(v) for v in versions if v.isascii() and v.removeprefix(&quot;-&quot;).isdigit()),</span>
+<span class="source-line" id="L232"><a href="#L232"> 232</a>             default=float(&quot;inf&quot;),</span>
+<span class="source-line" id="L233"><a href="#L233"> 233</a>         )</span>
+<span class="source-line" id="L234"><a href="#L234"> 234</a> </span>
+<span class="source-line" id="L235"><a href="#L235"> 235</a>     buffer.sort(key=oldest_version)</span>
+<span class="source-line" id="L236"><a href="#L236"> 236</a>     return pop_first(args, rollout_id, buffer, num_samples)</span>
+<span class="source-line" id="L237"><a href="#L237"> 237</a> </span>
+<span class="source-line" id="L238"><a href="#L238"> 238</a> </span>
+<span class="source-line" id="L239"><a href="#L239"> 239</a> def pop_first(args, rollout_id, buffer: list[list[Sample]], num_samples: int) -&gt; list[list[Sample]]:</span>
+<span class="source-line" id="L240"><a href="#L240"> 240</a>     num_to_pop = min(len(buffer), num_samples)</span>
+<span class="source-line" id="L241"><a href="#L241"> 241</a>     samples = buffer[:num_to_pop]</span>
+<span class="source-line" id="L242"><a href="#L242"> 242</a>     del buffer[:num_to_pop]</span>
+<span class="source-line" id="L243"><a href="#L243"> 243</a>     return samples</span></code></pre></main></body></html>

@@ -1,0 +1,35 @@
+<!doctype html><html lang="zh-Hans"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="description" content="从 Ray 入门到读懂 slime/ray：基于固定源码的中文交互教程。">
+<title>slime/rollout/base_types.py · Ray 与 slime 源码导读</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="../../../assets/style.css">
+<link rel="stylesheet" href="../../../assets/tutorial.css"></head><body class="source-page"><header class="topbar">
+<a class="brand" href="../../../index.html">Ray 与 slime</a><a href="https://github.com/THUDM/slime/blob/5bae5bb7928d65906e24e99f5b5d3f99a4daaf93/slime/rollout/base_types.py">GitHub 固定版本 ↗</a></header>
+<main class="source-wrap"><p><a href="../../../chapters/sources.html">← 源码索引</a> · 5bae5bb7928d · 只读快照</p>
+<h1>slime/rollout/base_types.py</h1><pre class="source-code"><code><span class="source-line" id="L1"><a href="#L1">   1</a> from dataclasses import dataclass</span>
+<span class="source-line" id="L2"><a href="#L2">   2</a> from typing import Any</span>
+<span class="source-line" id="L3"><a href="#L3">   3</a> </span>
+<span class="source-line" id="L4"><a href="#L4">   4</a> from slime.utils.types import Sample</span>
+<span class="source-line" id="L5"><a href="#L5">   5</a> </span>
+<span class="source-line" id="L6"><a href="#L6">   6</a> </span>
+<span class="source-line" id="L7"><a href="#L7">   7</a> @dataclass</span>
+<span class="source-line" id="L8"><a href="#L8">   8</a> class RolloutFnTrainOutput:</span>
+<span class="source-line" id="L9"><a href="#L9">   9</a>     samples: list[list[Sample]]</span>
+<span class="source-line" id="L10"><a href="#L10">  10</a>     metrics: dict[str, Any] = None</span>
+<span class="source-line" id="L11"><a href="#L11">  11</a> </span>
+<span class="source-line" id="L12"><a href="#L12">  12</a> </span>
+<span class="source-line" id="L13"><a href="#L13">  13</a> @dataclass</span>
+<span class="source-line" id="L14"><a href="#L14">  14</a> class RolloutFnEvalOutput:</span>
+<span class="source-line" id="L15"><a href="#L15">  15</a>     data: dict[str, dict[str, Any]]</span>
+<span class="source-line" id="L16"><a href="#L16">  16</a>     metrics: dict[str, Any] = None</span>
+<span class="source-line" id="L17"><a href="#L17">  17</a> </span>
+<span class="source-line" id="L18"><a href="#L18">  18</a> </span>
+<span class="source-line" id="L19"><a href="#L19">  19</a> def call_rollout_fn(fn, *args, evaluation: bool, **kwargs):</span>
+<span class="source-line" id="L20"><a href="#L20">  20</a>     output = fn(*args, **kwargs, evaluation=evaluation)</span>
+<span class="source-line" id="L21"><a href="#L21">  21</a> </span>
+<span class="source-line" id="L22"><a href="#L22">  22</a>     # compatibility for legacy version</span>
+<span class="source-line" id="L23"><a href="#L23">  23</a>     if not isinstance(output, (RolloutFnTrainOutput, RolloutFnEvalOutput)):</span>
+<span class="source-line" id="L24"><a href="#L24">  24</a>         output = RolloutFnEvalOutput(data=output) if evaluation else RolloutFnTrainOutput(samples=output)</span>
+<span class="source-line" id="L25"><a href="#L25">  25</a> </span>
+<span class="source-line" id="L26"><a href="#L26">  26</a>     return output</span></code></pre></main></body></html>

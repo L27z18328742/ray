@@ -1,0 +1,69 @@
+<!doctype html><html lang="zh-Hans"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="description" content="从 Ray 入门到读懂 slime/ray：基于固定源码的中文交互教程。">
+<title>术语与对象速查 · Ray 与 slime 源码导读</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="stylesheet" href="../assets/tutorial.css"></head><body data-chapter="glossary" data-lab="">
+<a class="skip" href="#content">跳到正文</a>
+<header class="topbar"><a class="brand" href="../index.html">Ray 与 slime<span>源码导读</span></a>
+<nav class="chapnav"><a href="../index.html">全部章节</a><a href="sources.html">版本与证据</a></nav></header>
+<div class="layout"><aside class="sidebar"><nav class="toc" id="toc"><h2>本章目录</h2><details class="book-nav"><summary>全书章节</summary><a href="ch00.html">先看一轮训练怎样发生</a><a href="ch01.html">第一次 remote：任务与结果引用</a><a href="ch02.html">Actor：让模型留在一个进程里</a><a href="ch03.html">等待、依赖与背压</a><a href="ch04.html">先安排座位：Placement Group</a><a href="ch05.html">把训练 worker 一个个启动起来</a><a href="ch06.html">RolloutManager 如何组织生成</a><a href="ch07.html">一批数据如何到达训练 GPU</a><a href="ch08.html">读通 train.py 的一整个循环</a><a href="ch09.html">训练完，推理模型怎么拿到新权重</a><a href="ch10.html">同卡部署、卸载与进程释放</a><a href="ch11.html">真正的异步发生在哪里</a><a href="ch12.html">卡住与失败时，沿边界排查</a><a href="ch13.html">亲手做一个 CPU 版迷你 slime</a><a href="glossary.html" aria-current="page">术语与对象速查</a><a href="practice.html">理解题与源码寻路任务</a><a href="sources.html">版本、证据与源码索引</a></details></nav></aside>
+<main class="main"><p class="chapter-meta">附录 / 附录 · 约 10 分钟 · 已展开</p>
+<details class="mobile-nav"><summary>选择章节</summary><a href="ch00.html">先看一轮训练怎样发生</a><a href="ch01.html">第一次 remote：任务与结果引用</a><a href="ch02.html">Actor：让模型留在一个进程里</a><a href="ch03.html">等待、依赖与背压</a><a href="ch04.html">先安排座位：Placement Group</a><a href="ch05.html">把训练 worker 一个个启动起来</a><a href="ch06.html">RolloutManager 如何组织生成</a><a href="ch07.html">一批数据如何到达训练 GPU</a><a href="ch08.html">读通 train.py 的一整个循环</a><a href="ch09.html">训练完，推理模型怎么拿到新权重</a><a href="ch10.html">同卡部署、卸载与进程释放</a><a href="ch11.html">真正的异步发生在哪里</a><a href="ch12.html">卡住与失败时，沿边界排查</a><a href="ch13.html">亲手做一个 CPU 版迷你 slime</a><a href="glossary.html" aria-current="page">术语与对象速查</a><a href="practice.html">理解题与源码寻路任务</a><a href="sources.html">版本、证据与源码索引</a></details><div id="lab-banner"></div>
+<article id="content" class="prose"></article><noscript>请启用 JavaScript 阅读网页，或直接查看 content 中的 Markdown。</noscript>
+<section id="lab" class="lab" hidden><h2 class="lab-title"></h2><p class="lab-intro"></p><div id="lab-root"></div></section>
+<div class="study-actions"><button id="mark-read" type="button">标记为已读</button><span id="read-status" role="status"></span></div>
+<nav class="pager"><a class="prev" href="ch13.html"><span class="dir">← 上一章</span><div class="ttl">亲手做一个 CPU 版迷你 slime</div></a><a class="next" href="practice.html"><span class="dir">下一章 →</span><div class="ttl">理解题与源码寻路任务</div></a></nav><footer class="pagefoot">独立中文源码教程 · slime 5bae5bb7928d · 源码事实、教学简化与实验结果分别标注。<br>视觉样式参考 Ultra-Scale Playbook 中文版；署名见 <a href="sources.html">来源与许可</a>。</footer>
+</main></div><script type="text/markdown" id="chapter-md"># 术语与对象速查
+
+## 先查对象类型
+
+| 名称或表达式 | 类型 / 所在位置 | 应该怎么使用 |
+|---|---|---|
+| `args` | 普通配置对象 | 决定创建规模和分支 |
+| `bundles` | Python list of dict | 传给 PG 创建接口 |
+| `pg` | Ray PlacementGroup 句柄 | 调度策略引用它 |
+| `pg.ready()` | ObjectRef | 等资源组准备好 |
+| `actor_model` | driver 中的 RayTrainGroup | 普通方法组织远程调用 |
+| `_actor_handlers[i]` | ActorHandle | 用 `.method.remote()`发命令 |
+| `actor.train.remote(...)` | ObjectRef | 等一次训练方法结果 |
+| `async_train(...)` | list[ObjectRef] | 等所有训练 worker |
+| `rollout_manager` | ActorHandle | 调用生成、评估、服务管理接口 |
+| driver 的 `rollout_data_ref` | 默认是 list[Box] | 传给训练组，名称不能代替类型检查 |
+| `rollout_data_ref[dp_rank].inner` | ObjectRef | 在训练 worker 中获取对应分片 |
+| `rollout_data` | 具体训练字典 | token、mask、reward 与调度元数据 |
+
+## 再查系统名词
+
+| 术语 | 在本教程里的意思 | 别与什么混淆 |
+|---|---|---|
+| driver | 执行主编排程序的进程 | 不是所有 GPU 计算都在这里 |
+| Ray head | 提供 Ray 集群控制服务的节点角色 | 不等于训练 rank 0 |
+| task | 一次远程函数调用或 actor method 调用的工作 | 不等于 CUDA kernel |
+| Actor | 有状态的远程对象与对应 worker | 不等于 RL 的策略角色 |
+| ObjectRef | 指向远程结果的引用 | 不等于已取回的结果 |
+| bundle | 一份逻辑资源需求 | 不等于硬件隔离分区 |
+| PG | Placement Group，资源预留 / 放置 | 不等于 PyTorch Process Group |
+| rank | 某通信组中的进程编号 | 不一定是物理 GPU ID |
+| world size | 某进程组的成员数量 | 不一定是 DP size |
+| DP | 不同副本处理不同的数据分片 | 不等于一切训练 rank |
+| TP / PP / CP | 参数计算 / 模型层 / 序列上下文的并行划分 | Ray 不负责其数学实现 |
+| rollout | 用策略生成轨迹 / 样本的过程，也可指某条轨迹 | 轮次编号与 sample 数量不同 |
+| policy / actor | RL 中生成动作的策略模型 | 不等于 Ray Actor 类本身 |
+| critic | 价值模型角色 | 主线入门可以先不启用 |
+| router | 为生成 HTTP 请求选择服务端 | 不是 Ray scheduler |
+| engine | 一套推理服务实例，可含多个 GPU worker | 不总是一张卡一个 |
+| microbatch | 一个训练 step 内更小的批次 | 不等于整个 rollout batch |
+| backpressure | 消费跟不上时抑制继续生产 | 不等于无条件取消在途任务 |
+| offload | 转移 / 释放部分设备驻留状态 | 不等于销毁进程 |
+| release | 本教程分支中指销毁训练 Actors | 不等于移除 PG |
+| staleness | 样本生成策略相对当前训练策略的陈旧程度 | 不只是网络延迟 |
+
+## 三个“就绪”问题
+
+问“资源是否就绪”，看 PG。问“方法是否完成”，看对应引用与异常。问“模型状态是否可用于下一阶段”，看初始化、权重版本、通信完成与保存恢复证据。它们分别回答不同的问题。
+
+需要继续找实现时，使用[源码索引](sources.html)中的固定版本链接。
+</script>
+<script src="../assets/marked.min.js"></script><script src="../assets/app.js"></script><script src="../assets/labs.js"></script></body></html>
